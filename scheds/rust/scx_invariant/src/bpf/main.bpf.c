@@ -135,7 +135,7 @@ void BPF_STRUCT_OPS(invariant_running, struct task_struct *p)
 		evt->waker_tgid = 0;
 		evt->waker_flags = 0;
 		evt->cpu_perf = 0;
-		evt->prev_cpu = -1;
+		evt->prev_cpu = tctx->last_cpu;
 		evt->wake_flags = 0;
 		/* PMU fields zeroed for now (Task 5 adds perf counters) */
 		evt->pmc_instructions = 0;
