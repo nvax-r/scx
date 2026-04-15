@@ -1,6 +1,7 @@
 mod bpf_skel;
 pub use bpf_skel::*;
 pub mod bpf_intf;
+mod recorder;
 
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +13,7 @@ use log::info;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
-use scx_utils::uei_exited;
+use scx_utils::try_set_rlimit_infinity;
 use scx_utils::uei_report;
 use scx_utils::UserExitInfo;
 
@@ -25,6 +26,8 @@ struct Scheduler<'a> {
 
 impl<'a> Scheduler<'a> {
     fn init(open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
+
+        try_set_rlimit_infinity();
 
         info!("{} starting", SCHEDULER_NAME);
 
@@ -39,9 +42,8 @@ impl<'a> Scheduler<'a> {
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
-        while !shutdown.load(Ordering::Relaxed) && !uei_exited!(&self.skel, uei) {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
+        let event_count = recorder::run_consumer(&self.skel, shutdown)?;
+        info!("Recorded {} events", event_count);
 
         let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)
