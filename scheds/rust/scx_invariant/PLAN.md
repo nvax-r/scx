@@ -239,8 +239,8 @@ struct scx_invariant_event {
 |------|-------|-----------:|---------|--------|
 | EVT_RUNNING | 1 | 88 B | Task started executing on a CPU | Done |
 | EVT_STOPPING | 2 | 88 B | Task stopped executing | Done |
-| EVT_RUNNABLE | 3 | 40 B | Task became runnable (woke up) | Pending |
-| EVT_QUIESCENT | 4 | 32 B | Task went to sleep | Pending |
+| EVT_RUNNABLE | 3 | 40 B | Task became runnable (woke up) | Done |
+| EVT_QUIESCENT | 4 | 32 B | Task went to sleep | Done |
 | EVT_TICK | 5 | 64 B | Periodic PMU snapshot during long quantum | Pending |
 
 Flags (`scx_invariant_event.flags`):
@@ -282,8 +282,9 @@ Each task moves through these states. Each transition is an event we record.
                        EVT_QUIESCENT ←
 ```
 
-Currently we record `EVT_RUNNING` and `EVT_STOPPING`. Adding the other three
-completes the state machine.
+All four state-transition events (`EVT_RUNNING`, `EVT_STOPPING`, `EVT_RUNNABLE`,
+`EVT_QUIESCENT`) are now recorded. `EVT_TICK` for periodic PMU snapshots during
+long quanta is the remaining optional addition (Task 7).
 
 ---
 
@@ -324,14 +325,28 @@ Future additions (planned tasks):
 | 2 | EVT_RUNNING / EVT_STOPPING | running/stopping callbacks; 6 ring buffers; recorder.rs | Done |
 | 2.5 | Binary writer + Python reader | output.rs, .scxi format, reader.py — full pipeline | Done |
 | 3 | Cgroup filtering | bpf_task_under_cgroup() filter; cgroup.rs auto-setup | Pending |
-| 4a | Sleep durations | runnable + quiescent callbacks; EVT_RUNNABLE/EVT_QUIESCENT | Pending |
-| 4b | Wakeup attribution | select_cpu callback; waker fields in EVT_RUNNING | Pending |
-| 5 | PMU integration | perf_event_open per CPU; PMU reads in running/stopping | Pending |
+| 4a | Sleep durations | runnable + quiescent callbacks; EVT_RUNNABLE/EVT_QUIESCENT | Done |
+| 4b | Wakeup attribution | select_cpu callback; waker fields in EVT_RUNNING | Done |
+| 5 | PMU integration | perf_event_open per CPU; PMU reads in running/stopping; also populate `cpu_perf` from `scx_bpf_cpuperf_cur()` | Pending |
 | 7 | Tick recording | ops.tick() callback; periodic PMU snapshots | Pending |
 
-Tasks 4a and 4b were originally bundled but are independent. Recommended order:
-**4a first** (simpler, completes task state machine), then **4b** (trickier
-because select_cpu runs in the wakers context, complicating cgroup filtering).
+**Recommended next order** for the remaining work:
+
+1. **Task 3 — Cgroup filtering** (highest priority). Without scoping, every
+   recording is system-wide, producing hundreds of MB of irrelevant events for
+   small target workloads. The PLAN.md analysis layer assumes a PID tree; we
+   should stop recording outside that tree at the source.
+2. **Task 5 — PMU integration**. Fills in `pmc_instructions`, `pmc_cycles`,
+   `pmc_l2_misses`, `pmc_stall_backend` (currently zero) and populates
+   `cpu_perf` from `scx_bpf_cpuperf_cur()`. Unlocks IPC / stall / migration-cost
+   analysis in the reader.
+3. **Task 7 — Tick recording**. Periodic PMU snapshots for long-running
+   quanta. Optional; benefits CPU-bound workloads that rarely hit
+   running/stopping.
+
+Tasks 4a and 4b were implemented together in commit `139b7850` along with a
+fix for a first-run false-migration bug (`last_cpu >= 0` passed trivially on
+zero-initialized task storage).
 
 ---
 
@@ -354,7 +369,9 @@ For every thread in the workload:
 - Voluntary vs involuntary context-switch ratio
 - Slice utilization — how much of the allocated slice was actually used
 - Per-quantum PMU profile — IPC, L2 miss rate, backend stall breakdown
-- Sleep duration distribution — how long the thread blocks, on what signal
+- Sleep duration distribution — how long the thread blocks. The "on what signal"
+  detail (futex address, IO fd, etc.) requires tracking syscalls or blocker state
+  beyond sched_ext callbacks and is deferred to a Phase 2 expansion.
 
 ### Per-Workload Analysis
 
