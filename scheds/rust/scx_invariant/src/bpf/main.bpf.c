@@ -104,6 +104,22 @@ static __always_inline void rb_drop_inc(void)
 		__sync_fetch_and_add(cnt, 1);
 }
 
+s32 BPF_STRUCT_OPS(invariant_select_cpu, struct task_struct *p, s32 prev_cpu,
+		   u64 wake_flags)
+{
+	struct task_ctx *tctx = bpf_task_storage_get(
+		&task_ctx_map, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (!tctx)
+		return prev_cpu;
+
+	struct task_struct *waker = bpf_get_current_task_btf();
+	tctx->waker_pid = waker->pid;
+	tctx->waker_tgid = waker->tgid;
+	tctx->waker_wake_flags = wake_flags;
+
+	return prev_cpu;
+}
+
 void BPF_STRUCT_OPS(invariant_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
@@ -118,7 +134,8 @@ void BPF_STRUCT_OPS(invariant_running, struct task_struct *p)
 
 	u64 now = scx_bpf_now();
 	s32 cpu = scx_bpf_task_cpu(p);
-	bool migrated = (tctx->last_cpu >= 0 && tctx->last_cpu != cpu);
+	bool first_run = (tctx->last_running_at == 0);
+	bool migrated = !first_run && (tctx->last_cpu != cpu);
 
 	struct evt_running *evt = rb_reserve(cpu, sizeof(*evt));
 	if (evt) {
@@ -130,13 +147,12 @@ void BPF_STRUCT_OPS(invariant_running, struct task_struct *p)
 		evt->hdr.flags = migrated ? FLAG_MIGRATED : 0;
 		evt->runq_wait_ns = (p->scx.runnable_at > 0) ?
 				     (now - p->scx.runnable_at) : 0;
-		/* Waker fields zeroed for now (Task 4 adds select_cpu) */
-		evt->waker_pid = 0;
-		evt->waker_tgid = 0;
-		evt->waker_flags = 0;
+		evt->waker_pid = tctx->waker_pid;
+		evt->waker_tgid = tctx->waker_tgid;
+		evt->waker_flags = tctx->waker_flags;
 		evt->cpu_perf = 0;
-		evt->prev_cpu = tctx->last_cpu;
-		evt->wake_flags = 0;
+		evt->prev_cpu = first_run ? -1 : tctx->last_cpu;
+		evt->wake_flags = tctx->waker_wake_flags;
 		/* PMU fields zeroed for now (Task 5 adds perf counters) */
 		evt->pmc_instructions = 0;
 		evt->pmc_cycles = 0;
@@ -150,6 +166,11 @@ void BPF_STRUCT_OPS(invariant_running, struct task_struct *p)
 	tctx->last_running_at = now;
 	tctx->last_cpu = cpu;
 	tctx->slice_at_start = p->scx.slice;
+	/* Clear waker fields to avoid stale data on next schedule */
+	tctx->waker_pid = 0;
+	tctx->waker_tgid = 0;
+	tctx->waker_flags = 0;
+	tctx->waker_wake_flags = 0;
 }
 
 void BPF_STRUCT_OPS(invariant_stopping, struct task_struct *p, bool runnable)
@@ -187,6 +208,64 @@ void BPF_STRUCT_OPS(invariant_stopping, struct task_struct *p, bool runnable)
 	tctx->last_stopping_at = now;
 }
 
+void BPF_STRUCT_OPS(invariant_runnable, struct task_struct *p, u64 enq_flags)
+{
+	struct task_ctx *tctx = bpf_task_storage_get(
+		&task_ctx_map, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (!tctx)
+		return;
+
+	u64 now = scx_bpf_now();
+	s32 cpu = scx_bpf_task_cpu(p);
+	u64 sleep_duration = 0;
+
+	if (tctx->last_quiescent_at > 0)
+		sleep_duration = now - tctx->last_quiescent_at;
+
+	struct evt_runnable *evt = rb_reserve(cpu, sizeof(*evt));
+	if (evt) {
+		evt->hdr.timestamp_ns = now;
+		evt->hdr.pid = p->pid;
+		evt->hdr.tgid = p->tgid;
+		evt->hdr.cpu = cpu;
+		evt->hdr.event_type = EVT_RUNNABLE;
+		evt->hdr.flags = 0;
+		evt->sleep_duration_ns = sleep_duration;
+		evt->enq_flags = (u32)enq_flags;
+		evt->pad = 0;
+		rb_submit(evt);
+	} else {
+		rb_drop_inc();
+	}
+}
+
+void BPF_STRUCT_OPS(invariant_quiescent, struct task_struct *p, u64 deq_flags)
+{
+	struct task_ctx *tctx = bpf_task_storage_get(&task_ctx_map, p, 0, 0);
+	if (!tctx)
+		return;
+
+	u64 now = scx_bpf_now();
+	s32 cpu = scx_bpf_task_cpu(p);
+
+	tctx->last_quiescent_at = now;
+
+	struct evt_quiescent *evt = rb_reserve(cpu, sizeof(*evt));
+	if (evt) {
+		evt->hdr.timestamp_ns = now;
+		evt->hdr.pid = p->pid;
+		evt->hdr.tgid = p->tgid;
+		evt->hdr.cpu = cpu;
+		evt->hdr.event_type = EVT_QUIESCENT;
+		evt->hdr.flags = 0;
+		evt->deq_flags = (u32)deq_flags;
+		evt->pad = 0;
+		rb_submit(evt);
+	} else {
+		rb_drop_inc();
+	}
+}
+
 s32 BPF_STRUCT_OPS_SLEEPABLE(invariant_init)
 {
 	return 0;
@@ -198,9 +277,12 @@ void BPF_STRUCT_OPS(invariant_exit, struct scx_exit_info *ei)
 }
 
 SCX_OPS_DEFINE(invariant_ops,
+	       .select_cpu = (void *)invariant_select_cpu,
 	       .enqueue   = (void *)invariant_enqueue,
+	       .runnable  = (void *)invariant_runnable,
 	       .running   = (void *)invariant_running,
 	       .stopping  = (void *)invariant_stopping,
+	       .quiescent = (void *)invariant_quiescent,
 	       .init      = (void *)invariant_init,
 	       .exit      = (void *)invariant_exit,
 	       .flags     = SCX_OPS_ENQ_LAST | SCX_OPS_ENQ_EXITING,

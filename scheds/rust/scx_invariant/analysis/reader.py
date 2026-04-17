@@ -53,6 +53,16 @@ RUNNING_SIZE = struct.calcsize(RUNNING_FMT)
 STOPPING_FMT = "<QQQQQQQB7x"
 STOPPING_SIZE = struct.calcsize(STOPPING_FMT)
 
+# evt_runnable payload after header (16 bytes):
+#   sleep_duration_ns(u64) enq_flags(u32) pad(u32)
+RUNNABLE_FMT = "<QII"
+RUNNABLE_SIZE = struct.calcsize(RUNNABLE_FMT)
+
+# evt_quiescent payload after header (8 bytes):
+#   deq_flags(u32) pad(u32)
+QUIESCENT_FMT = "<II"
+QUIESCENT_SIZE = struct.calcsize(QUIESCENT_FMT)
+
 
 def decode_kernel_ver(v):
     major = (v >> 16) & 0xFFFF
@@ -205,6 +215,19 @@ def parse_event(evt_type, payload):
             "voluntary": fields[7],
         })
 
+    elif evt_type == EVT_RUNNABLE and len(body) >= RUNNABLE_SIZE:
+        fields = struct.unpack_from(RUNNABLE_FMT, body, 0)
+        result.update({
+            "sleep_duration_ns": fields[0],
+            "enq_flags": fields[1],
+        })
+
+    elif evt_type == EVT_QUIESCENT and len(body) >= QUIESCENT_SIZE:
+        fields = struct.unpack_from(QUIESCENT_FMT, body, 0)
+        result.update({
+            "deq_flags": fields[0],
+        })
+
     return result
 
 
@@ -322,7 +345,34 @@ def main():
             )
         print()
 
-    # Wakeup graph placeholder
+    # Sleep duration analysis (from RUNNABLE events)
+    thread_sleep_total = defaultdict(int)
+    thread_sleep_count = defaultdict(int)
+    for evt_type, payload in raw_events:
+        if evt_type != EVT_RUNNABLE:
+            continue
+        parsed = parse_event(evt_type, payload)
+        if not parsed:
+            continue
+        sleep_ns = parsed.get("sleep_duration_ns", 0)
+        if sleep_ns > 0:
+            pid = parsed["pid"]
+            thread_sleep_total[pid] += sleep_ns
+            thread_sleep_count[pid] += 1
+
+    if thread_sleep_total:
+        print("=== Top 20 Threads by Total Sleep Duration ===")
+        top = sorted(thread_sleep_total.items(), key=lambda x: x[1], reverse=True)[:20]
+        print(f"  {'PID':>8}  {'Name':<16} {'TotalSleep':>12}  {'Wakeups':>8}  {'AvgSleep':>10}")
+        print(f"  {'-'*8}  {'-'*16} {'-'*12}  {'-'*8}  {'-'*10}")
+        for pid, total in top:
+            name = procs.get(pid, "?")
+            count = thread_sleep_count[pid]
+            avg = total // count if count > 0 else 0
+            print(f"  {pid:>8}  {name:<16} {format_ns(total):>12}  {count:>8}  {format_ns(avg):>10}")
+        print()
+
+    # Wakeup graph (from RUNNING events with waker data)
     waker_counts = defaultdict(int)
     for evt_type, payload in raw_events:
         if evt_type != EVT_RUNNING:
@@ -341,7 +391,7 @@ def main():
         print()
     else:
         print("=== Wakeup Graph ===")
-        print("  (no waker data yet — waker fields are zero until select_cpu is implemented)")
+        print("  (no waker data recorded)")
         print()
 
 
