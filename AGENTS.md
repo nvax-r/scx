@@ -6,16 +6,19 @@ This file is the root entrypoint for coding agents working in this repository.
 
 Read these files in order before any implementation or review:
 
-1. `docs/overview.md`
-2. `docs/architecture.md`
-3. `docs/conventions.md`
-4. `docs/eval.md`
-5. `docs/glossary.md`
+1. `scheds/rust/scx_invariant/PLAN.md` — project plan, architecture, final goal
+2. `docs/overview.md`
+3. `docs/architecture.md`
+4. `docs/conventions.md`
+5. `docs/eval.md`
+6. `docs/glossary.md`
 
 Then read:
 
-6. `agents/program.md` (for implementation) or `agents/reviewer.md` (for review)
-7. `work/task.md` (human-authored task source of truth)
+7. `agents/program.md` (for implementation) or `agents/reviewer.md` (for review)
+8. `work/task.md` (human-authored task source of truth)
+
+`PLAN.md` is the authoritative reference for *what* the project is building and *why* — including the per-task / per-workload analysis layer that is the eventual deliverable. Every contributor should understand the full goal before touching code.
 
 ## Scope and safety
 
