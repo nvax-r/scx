@@ -55,12 +55,17 @@ pub fn run_consumer(
 
     info!("Ring buffer consumer started (6 partitions)");
 
+    // The BPF side submits with BPF_RB_NO_WAKEUP to avoid per-event IPIs at
+    // 1M+ events/sec. ring_buffer__poll() is wakeup-driven (epoll-based) and
+    // would never see those records, so we must pull-drain via
+    // ring_buffer__consume() on a fixed cadence instead.
     while !shutdown.load(Ordering::Relaxed) {
-        let _ = rb.poll(Duration::from_millis(1));
+        let _ = rb.consume();
+        std::thread::sleep(Duration::from_millis(1));
     }
 
-    // Final drain
-    let _ = rb.poll(Duration::from_millis(0));
+    // Final drain after shutdown signal
+    let _ = rb.consume();
 
     let total = EVENT_COUNT.load(Ordering::Relaxed);
 

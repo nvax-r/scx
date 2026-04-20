@@ -12,11 +12,13 @@ Read these files in order before any implementation or review:
 4. `docs/conventions.md`
 5. `docs/eval.md`
 6. `docs/glossary.md`
+7. Ask user where is the repo of the corresponding linux kernel, don't guess by yourself
 
-Then read:
+Then you MUST read:
 
-7. `agents/program.md` (for implementation) or `agents/reviewer.md` (for review)
-8. `work/task.md` (human-authored task source of truth)
+8. `kernel/sched/ext.c` in the kernel code, and understand the bpf subsystem
+9. `agents/program.md` (for implementation) or `agents/reviewer.md` (for review)
+10. `work/task.md` (human-authored task source of truth)
 
 `PLAN.md` is the authoritative reference for *what* the project is building and *why* — including the per-task / per-workload analysis layer that is the eventual deliverable. Every contributor should understand the full goal before touching code.
 
