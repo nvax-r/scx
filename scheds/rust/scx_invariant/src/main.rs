@@ -3,6 +3,7 @@ pub use bpf_skel::*;
 pub mod bpf_intf;
 mod cgroup;
 mod output;
+mod pmu;
 mod recorder;
 
 use std::ffi::CString;
@@ -135,23 +136,53 @@ fn resolve_mode(args: Args) -> Result<Mode> {
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
+    /// PMU perf-event fds. Held for the lifetime of the scheduler so
+    /// the kernel keeps the counters running and the perf-event-array
+    /// map slots stay valid. `Drop` closes the fds, which removes
+    /// them from the BPF map automatically (kernel side).
+    ///
+    /// Not an `Option`: `Pmu::open` and `Pmu::install` are both
+    /// infallible (per `work/task.md` "Approach D rejected" — the
+    /// recorder must always start). Per-CPU and per-counter failures
+    /// are logged and leave their slots unset; BPF reads return 0
+    /// for those slots, matching the pre-Task-5 placeholder.
+    _pmu: pmu::Pmu,
 }
 
 impl<'a> Scheduler<'a> {
-    /// Open, configure rodata, load, and attach the BPF scheduler.
+    /// Open, configure rodata, load, install PMU fds, and attach the
+    /// BPF scheduler.
+    ///
+    /// Sequencing matters:
+    ///   1. `scx_ops_open!`  — builds the open skeleton in userspace.
+    ///   2. set rodata       — `cgroup_filtering`, `target_cgid` are
+    ///                         frozen at load.
+    ///   3. `scx_ops_load!`  — creates BPF maps in the kernel and
+    ///                         loads programs. Map fds become valid.
+    ///   4. `Pmu::open`      — opens system-wide CPU-pinned perf
+    ///                         events. Best-effort: per-CPU failures
+    ///                         leave that slot zero in the trace.
+    ///   5. `Pmu::install`   — pushes fds into the four perf-event
+    ///                         arrays. Must run before attach so the
+    ///                         very first running/stopping callback
+    ///                         sees populated maps.
+    ///   6. `scx_ops_attach!`— scheduler goes live.
+    ///
+    /// **Deviation from `work/task.md`:** the task spec says "Pmu::open
+    /// + Pmu::install between scx_ops_open! and scx_ops_load!". That
+    /// placement does not work — `bpf_map_update_elem` requires a real
+    /// map fd which only exists after load. See `work/notes.md`
+    /// 2026-04-20 entry for the rationale.
     ///
     /// `target_cgid`:
     ///   * `None`         — system-wide mode; rodata `cgroup_filtering = false`.
     ///   * `Some(cgid)`   — filter to the cgroup whose inode == `cgid`;
     ///                      BPF gates every recording callback on
     ///                      `bpf_task_under_cgroup(p, bpf_cgroup_from_id(cgid))`.
-    ///
-    /// Rodata MUST be set between open and load — once `scx_ops_load!` has
-    /// freezed the maps, the values are immutable for the lifetime of the
-    /// BPF program.
     fn init(
         open_object: &'a mut MaybeUninit<OpenObject>,
         target_cgid: Option<u64>,
+        nr_cpus: u16,
     ) -> Result<Self> {
         try_set_rlimit_infinity();
 
@@ -181,11 +212,23 @@ impl<'a> Scheduler<'a> {
         }
 
         let mut skel = scx_ops_load!(skel, invariant_ops, uei)?;
+
+        // PMU setup. Infallible by contract: every failure path
+        // (perf_event_open denied, map update rejected) is logged
+        // and demoted to "this slot reads 0 in the trace". The
+        // recorder always starts. See pmu.rs for the rationale.
+        let pmu = pmu::open_and_install(&skel, nr_cpus);
+        info!("PMU events installed for {} CPUs", nr_cpus);
+
         let struct_ops = Some(scx_ops_attach!(skel, invariant_ops)?);
 
         info!("{} scheduler attached", SCHEDULER_NAME);
 
-        Ok(Self { skel, struct_ops })
+        Ok(Self {
+            skel,
+            struct_ops,
+            _pmu: pmu,
+        })
     }
 
     fn run(
@@ -389,7 +432,7 @@ fn main() -> Result<()> {
     let target_cgid = cgroup.as_ref().map(|c| c.cgid()).transpose()?;
 
     let mut open_object = MaybeUninit::uninit();
-    let mut sched = Scheduler::init(&mut open_object, target_cgid)?;
+    let mut sched = Scheduler::init(&mut open_object, target_cgid, nr_cpus)?;
 
     // Spawn the workload AFTER the BPF scheduler is attached so its very
     // first scheduling transition is captured. The watcher thread flips

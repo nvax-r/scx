@@ -105,6 +105,106 @@ struct {
 	__uint(max_entries, 1);
 } drop_counter SEC(".maps");
 
+/*
+ * PMU perf-event arrays (Task 5 of scx_invariant PLAN.md).
+ *
+ * One array per logical counter, indexed by cpu_id. Userspace populates
+ * each slot via bpf_map__update_elem with a perf_event fd opened in
+ * system-wide CPU-pinned mode (pid=-1, cpu=N). BPF reads with
+ * bpf_perf_event_read_value(); when a slot is unset (open failed for that
+ * cpu) the helper returns -ENOENT and read_pmc() returns 0 — the field
+ * lands in the trace as 0 rather than refusing to record.
+ *
+ * max_entries is set to a generous static upper bound (1024) so the map
+ * fits any host this scheduler is likely to run on without negotiating
+ * sizes with userspace at load time. Slots beyond nr_cpus stay unset.
+ */
+#define SCX_INVARIANT_MAX_CPUS 1024
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(int));
+	__uint(max_entries, SCX_INVARIANT_MAX_CPUS);
+} pmu_instructions SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(int));
+	__uint(max_entries, SCX_INVARIANT_MAX_CPUS);
+} pmu_cycles SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(int));
+	__uint(max_entries, SCX_INVARIANT_MAX_CPUS);
+} pmu_l2_misses SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(int));
+	__uint(max_entries, SCX_INVARIANT_MAX_CPUS);
+} pmu_stall_backend SEC(".maps");
+
+/*
+ * Read a single PMU counter for @cpu via the given perf-event-array map.
+ *
+ * Returns 0 when the slot is unset, the helper rejects the read (e.g.
+ * counter not enabled, multiplexing pause), or any other failure. Callers
+ * pair this with a saved start value, so 0 simply yields a delta of zero
+ * which the reader interprets as "no PMU data this quantum" — same as
+ * the pre-Task-5 placeholder behavior.
+ *
+ * We deliberately ignore v.enabled / v.running for now. With four counters
+ * per CPU we expect to fit on every PMU we care about without
+ * multiplexing; if measurement later shows divergence we can scale by
+ * (enabled / running) without changing the on-disk format.
+ */
+static __always_inline u64 read_pmc(void *map, s32 cpu)
+{
+	struct bpf_perf_event_value v = {};
+
+	if (bpf_perf_event_read_value(map, cpu, &v, sizeof(v)) < 0)
+		return 0;
+	return v.counter;
+}
+
+/*
+ * Saturating subtraction for per-quantum PMC deltas.
+ *
+ * Both `end` and `start` are u64 perf-counter samples from `read_pmc()`.
+ * Two failure modes can make `end < start` and turn a naive `end - start`
+ * into a near-UINT64_MAX wraparound:
+ *
+ *   1. The counter was readable at running() time (start > 0) but the
+ *      stopping() read failed (`end == 0`). ARM PMU power-state
+ *      transitions, transient -EBUSY from event multiplexing, or any
+ *      kfunc-returns-negative path triggers this. The reverse
+ *      (start == 0, end > 0) is a documented one-off; this direction
+ *      is the catastrophic one — a single underflowed sample dominates
+ *      any aggregator over the whole trace.
+ *
+ *   2. running() was skipped for this quantum while stopping() fires
+ *      (kernel SCX_TASK_QUEUED pairing isn't airtight under hotplug /
+ *      fork-into-SCX races). `tctx->pmc_*_start` then carries values
+ *      from a *previous* quantum, which are typically smaller than the
+ *      current `end` — so this case usually produces an inflated-but-
+ *      positive delta rather than an underflow. Sat-sub doesn't fully
+ *      neutralize it; a generation-bit guard would. We accept that
+ *      higher-order bug for now and just kill the underflow.
+ *
+ * Returns 0 when end < start, matching the start-side "no PMU data this
+ * quantum" semantics. The reader still sees zero counters as "missing";
+ * that's better than poisoned aggregates.
+ */
+static __always_inline u64 sat_sub(u64 end, u64 start)
+{
+	return end >= start ? end - start : 0;
+}
+
 static __always_inline void *rb_reserve(u32 cpu, u64 size)
 {
 	if ((cpu % 6) == 0)
@@ -183,6 +283,42 @@ void BPF_STRUCT_OPS(invariant_running, struct task_struct *p)
 	bool first_run = (tctx->last_running_at == 0);
 	bool migrated = !first_run && (tctx->last_cpu != cpu);
 
+	/*
+	 * Snapshot per-task PMU baselines for the quantum (Task 5).
+	 *
+	 * The snapshots land in task storage (tctx->pmc_*_start), where
+	 * invariant_stopping pairs them against end-of-quantum reads to
+	 * compute the per-quantum delta written into evt_stopping.
+	 *
+	 * We deliberately do NOT publish these raw start-of-quantum
+	 * snapshots into evt_running's pmc_* slots. Reasoning:
+	 *   1. A lifetime CPU-wide counter snapshot at one arbitrary
+	 *      moment is not standalone meaningful — it only gains
+	 *      meaning when diffed against another snapshot on the same
+	 *      CPU, which is precisely what the matching evt_stopping
+	 *      delta already provides.
+	 *   2. evt_running.pmc_* and evt_stopping.pmc_* share field names
+	 *      across the on-disk format. Putting different physical
+	 *      units in identically-named fields is a footgun: any
+	 *      future aggregator that iterates all events and sums
+	 *      pmc_instructions would silently double-count
+	 *      (lifetime totals + per-quantum deltas).
+	 * The slots stay in evt_running for format-stability (no payload
+	 * size change vs. older traces) but are written as zero. cpu_perf
+	 * IS standalone meaningful (it's a normalized [1, SCX_CPUPERF_ONE]
+	 * frequency-state hint) and stays populated.
+	 *
+	 * Read happens before rb_reserve so the start values land in
+	 * task storage even if the ringbuf reservation fails — otherwise
+	 * a single drop here would desync the next stopping callback's
+	 * delta computation. read_pmc() returns 0 when a counter slot is
+	 * unset; the corresponding stopping delta then reads as 0 too.
+	 */
+	u64 ins_start    = read_pmc(&pmu_instructions, cpu);
+	u64 cyc_start    = read_pmc(&pmu_cycles,       cpu);
+	u64 l2m_start    = read_pmc(&pmu_l2_misses,    cpu);
+	u64 stall_start  = read_pmc(&pmu_stall_backend, cpu);
+
 	struct evt_running *evt = rb_reserve(cpu, sizeof(*evt));
 	if (evt) {
 		evt->hdr.timestamp_ns = now;
@@ -196,13 +332,25 @@ void BPF_STRUCT_OPS(invariant_running, struct task_struct *p)
 		evt->waker_pid = tctx->waker_pid;
 		evt->waker_tgid = tctx->waker_tgid;
 		evt->waker_flags = tctx->waker_flags;
-		evt->cpu_perf = 0;
+		/*
+		 * scx_bpf_cpuperf_cur() returns u32 in [1, SCX_CPUPERF_ONE]
+		 * where SCX_CPUPERF_ONE == SCHED_CAPACITY_SCALE == 1024 on
+		 * every supported config (include/linux/sched.h:453,458).
+		 * The full range fits in u16, so the cast is value-preserving;
+		 * we keep the trace-format slot as u16 per intf.h.
+		 */
+		evt->cpu_perf = (u16)scx_bpf_cpuperf_cur(cpu);
 		evt->prev_cpu = first_run ? -1 : tctx->last_cpu;
 		evt->wake_flags = tctx->waker_wake_flags;
-		/* PMU fields zeroed for now (Task 5 adds perf counters) */
-		evt->pmc_instructions = 0;
-		evt->pmc_cycles = 0;
-		evt->pmc_l2_misses = 0;
+		/*
+		 * Reserved-zero per the contract above. Real per-quantum
+		 * counter values live in evt_stopping. Do not start
+		 * populating these without re-reading the comment block at
+		 * the top of this function.
+		 */
+		evt->pmc_instructions  = 0;
+		evt->pmc_cycles        = 0;
+		evt->pmc_l2_misses     = 0;
 		evt->pmc_stall_backend = 0;
 		rb_submit(evt);
 	} else {
@@ -212,6 +360,10 @@ void BPF_STRUCT_OPS(invariant_running, struct task_struct *p)
 	tctx->last_running_at = now;
 	tctx->last_cpu = cpu;
 	tctx->slice_at_start = p->scx.slice;
+	tctx->pmc_instructions_start  = ins_start;
+	tctx->pmc_cycles_start        = cyc_start;
+	tctx->pmc_l2_misses_start     = l2m_start;
+	tctx->pmc_stall_backend_start = stall_start;
 	/* Clear waker fields to avoid stale data on next schedule */
 	tctx->waker_pid = 0;
 	tctx->waker_tgid = 0;
@@ -232,6 +384,35 @@ void BPF_STRUCT_OPS(invariant_stopping, struct task_struct *p, bool runnable)
 	s32 cpu = scx_bpf_task_cpu(p);
 	u64 runtime = now - tctx->last_running_at;
 
+	/*
+	 * Per-quantum PMU deltas (Task 5). u64 counter wraparound from
+	 * forward progress is not a practical concern over a single
+	 * scheduling quantum.
+	 *
+	 * We read system-wide CPU-pinned counters: on a single CPU, no
+	 * other task can run between this task's running and stopping
+	 * callbacks, so end - start equals the work this task performed
+	 * (plus any kernel-mode work — interrupts, softirqs — observed on
+	 * that CPU during the quantum, which is the standard accuracy /
+	 * cost tradeoff and acceptable per work/task.md "Approach A").
+	 *
+	 * sat_sub() handles the failure-mode cases where a naive
+	 * subtraction would underflow:
+	 *   - counter readable at running(), unreadable at stopping()
+	 *     (perf_event_open success at startup but transient kfunc
+	 *      failure now: pause, power state, multiplexing eviction);
+	 *   - running() skipped this quantum while stopping() fires
+	 *     (kernel SCX_TASK_QUEUED pairing race), leaving
+	 *     tctx->pmc_*_start stale from a prior quantum.
+	 * See sat_sub()'s comment for the full enumeration. The "unset at
+	 * start, available at end" case is bounded by counter lifetime
+	 * size and lands as a one-off oversized delta — acceptable.
+	 */
+	u64 ins_end   = read_pmc(&pmu_instructions,  cpu);
+	u64 cyc_end   = read_pmc(&pmu_cycles,        cpu);
+	u64 l2m_end   = read_pmc(&pmu_l2_misses,     cpu);
+	u64 stall_end = read_pmc(&pmu_stall_backend, cpu);
+
 	struct evt_stopping *evt = rb_reserve(cpu, sizeof(*evt));
 	if (evt) {
 		evt->hdr.timestamp_ns = now;
@@ -241,11 +422,10 @@ void BPF_STRUCT_OPS(invariant_stopping, struct task_struct *p, bool runnable)
 		evt->hdr.event_type = EVT_STOPPING;
 		evt->hdr.flags = runnable ? 0 : FLAG_VOLUNTARY;
 		evt->runtime_ns = runtime;
-		/* PMU deltas zeroed for now */
-		evt->pmc_instructions = 0;
-		evt->pmc_cycles = 0;
-		evt->pmc_l2_misses = 0;
-		evt->pmc_stall_backend = 0;
+		evt->pmc_instructions  = sat_sub(ins_end,   tctx->pmc_instructions_start);
+		evt->pmc_cycles        = sat_sub(cyc_end,   tctx->pmc_cycles_start);
+		evt->pmc_l2_misses     = sat_sub(l2m_end,   tctx->pmc_l2_misses_start);
+		evt->pmc_stall_backend = sat_sub(stall_end, tctx->pmc_stall_backend_start);
 		evt->slice_allocated_ns = tctx->slice_at_start;
 		evt->slice_consumed_ns = tctx->slice_at_start - p->scx.slice;
 		evt->voluntary = runnable ? 0 : 1;

@@ -63,9 +63,9 @@ detection, scheduler diffs) waits until the next phase.
 │  ops.enqueue    → SCX_DSQ_GLOBAL  (passthrough, no decision)         │
 │  ops.running    → emit EVT_RUNNING                                   │
 │  ops.stopping   → emit EVT_STOPPING                                  │
-│  ops.runnable   → (planned) emit EVT_RUNNABLE                        │
-│  ops.quiescent  → (planned) emit EVT_QUIESCENT                       │
-│  ops.select_cpu → (planned) capture waker into wakees task_ctx       │
+│  ops.runnable   → emit EVT_RUNNABLE                                  │
+│  ops.quiescent  → emit EVT_QUIESCENT                                 │
+│  ops.select_cpu → capture waker into wakees task_ctx                 │
 │  ops.tick       → (planned) emit EVT_TICK with PMU snapshot          │
 └──────────────────────────────────────────────────────────────────────┘
                               │
@@ -307,7 +307,7 @@ long quanta is the remaining optional addition (Task 7).
     └── reader.py               # Python parser for .scxi files
 ```
 
-Future additions (planned tasks):
+Both `cgroup.rs` (Task 3) and `pmu.rs` (Task 5) now exist in tree:
 
 ```
 └── src/
@@ -327,16 +327,12 @@ Future additions (planned tasks):
 | 3 | Cgroup filtering | bpf_task_under_cgroup() filter; cgroup.rs auto-setup; `record` subcommand with spawn + system-wide modes (attach mode deferred) | Done |
 | 4a | Sleep durations | runnable + quiescent callbacks; EVT_RUNNABLE/EVT_QUIESCENT | Done |
 | 4b | Wakeup attribution | select_cpu callback; waker fields in EVT_RUNNING | Done |
-| 5 | PMU integration | perf_event_open per CPU; PMU reads in running/stopping; also populate `cpu_perf` from `scx_bpf_cpuperf_cur()` | Pending |
+| 5 | PMU integration | perf_event_open per CPU; PMU reads in running/stopping; also populate `cpu_perf` from `scx_bpf_cpuperf_cur()` | Done |
 | 7 | Tick recording | ops.tick() callback; periodic PMU snapshots | Pending |
 
 **Recommended next order** for the remaining work:
 
-1. **Task 5 — PMU integration**. Fills in `pmc_instructions`, `pmc_cycles`,
-   `pmc_l2_misses`, `pmc_stall_backend` (currently zero) and populates
-   `cpu_perf` from `scx_bpf_cpuperf_cur()`. Unlocks IPC / stall / migration-cost
-   analysis in the reader.
-2. **Task 7 — Tick recording**. Periodic PMU snapshots for long-running
+1. **Task 7 — Tick recording**. Periodic PMU snapshots for long-running
    quanta. Optional; benefits CPU-bound workloads that rarely hit
    running/stopping.
 
