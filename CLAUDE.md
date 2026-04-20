@@ -13,8 +13,17 @@ Before writing or reviewing code, read:
 5. `docs/eval.md`
 6. `docs/glossary.md`
 
-After that, choose role instructions:
+7. Ask user where is the repo of the corresponding linux kernel, don't guess by yourself
 
+Then you MUST read:
+
+8. `kernel/sched/ext.c` in the kernel code, and understand the bpf subsystem
+9. `agents/program.md` (for implementation) or `agents/reviewer.md` (for review)
+10. `work/task.md` (human-authored task source of truth)
+
+After that, ask for your role if you don't know it yet, and choose role instructions:
+
+- Planner: no specific file in this repo now
 - Implementation: `agents/program.md`
 - Review: `agents/reviewer.md`
 

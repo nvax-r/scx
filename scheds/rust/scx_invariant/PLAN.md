@@ -324,7 +324,7 @@ Future additions (planned tasks):
 | 1 | Project scaffolding + bare passthrough | enqueue → global DSQ; Rust load/attach | Done |
 | 2 | EVT_RUNNING / EVT_STOPPING | running/stopping callbacks; 6 ring buffers; recorder.rs | Done |
 | 2.5 | Binary writer + Python reader | output.rs, .scxi format, reader.py — full pipeline | Done |
-| 3 | Cgroup filtering | bpf_task_under_cgroup() filter; cgroup.rs auto-setup | Pending |
+| 3 | Cgroup filtering | bpf_task_under_cgroup() filter; cgroup.rs auto-setup; `record` subcommand with spawn + system-wide modes (attach mode deferred) | Done |
 | 4a | Sleep durations | runnable + quiescent callbacks; EVT_RUNNABLE/EVT_QUIESCENT | Done |
 | 4b | Wakeup attribution | select_cpu callback; waker fields in EVT_RUNNING | Done |
 | 5 | PMU integration | perf_event_open per CPU; PMU reads in running/stopping; also populate `cpu_perf` from `scx_bpf_cpuperf_cur()` | Pending |
@@ -332,17 +332,23 @@ Future additions (planned tasks):
 
 **Recommended next order** for the remaining work:
 
-1. **Task 3 — Cgroup filtering** (highest priority). Without scoping, every
-   recording is system-wide, producing hundreds of MB of irrelevant events for
-   small target workloads. The PLAN.md analysis layer assumes a PID tree; we
-   should stop recording outside that tree at the source.
-2. **Task 5 — PMU integration**. Fills in `pmc_instructions`, `pmc_cycles`,
+1. **Task 5 — PMU integration**. Fills in `pmc_instructions`, `pmc_cycles`,
    `pmc_l2_misses`, `pmc_stall_backend` (currently zero) and populates
    `cpu_perf` from `scx_bpf_cpuperf_cur()`. Unlocks IPC / stall / migration-cost
    analysis in the reader.
-3. **Task 7 — Tick recording**. Periodic PMU snapshots for long-running
+2. **Task 7 — Tick recording**. Periodic PMU snapshots for long-running
    quanta. Optional; benefits CPU-bound workloads that rarely hit
    running/stopping.
+
+Task 3 (cgroup filtering) landed in two passes: BPF-side gating with rodata
+`cgroup_filtering` / `target_cgid` and `is_target_task(p)` was committed
+earlier (see `work/notes.md` 2026-04-17). The userspace half — `cgroup.rs`,
+the `record` subcommand with spawn + system-wide modes, and the child-exit
+watcher — was added on top, leaving BPF unchanged. **Attach mode**
+(`--cgroup <path>` against an existing cgroup such as a systemd slice) was
+intentionally cut from this iteration to keep the surface small; the BPF
+gate already supports it, so attach can come back later as a thin
+userspace addition without touching BPF or the trace format.
 
 Tasks 4a and 4b were implemented together in commit `139b7850` along with a
 fix for a first-run false-migration bug (`last_cpu >= 0` passed trivially on
@@ -463,13 +469,20 @@ rustup toolchain install stable
 cd ~/scx
 cargo build --release -p scx_invariant
 
-# Record (system-wide for now; cgroup filtering comes in Task 3)
+# Record system-wide (legacy form, still supported)
 sudo ~/scx/target/release/scx_invariant -o /tmp/test.scxi
 # Ctrl+C after a few seconds
+
+# Record only a spawned workload's process tree (Task 3, spawn mode)
+sudo ~/scx/target/release/scx_invariant record -o /tmp/spawn.scxi -- \
+    stress-ng --cpu 4 --timeout 5
 
 # Read back
 python3 ~/scx/scheds/rust/scx_invariant/analysis/reader.py /tmp/test.scxi
 ```
+
+(Attach mode against an existing cgroup is deferred; revisit if a real use
+case shows up.)
 
 Sanity check (per `docs/eval.md`):
 - Output prints "SCXI" magic and a sane header

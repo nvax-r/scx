@@ -1,9 +1,45 @@
 #include <scx/common.bpf.h>
 #include "intf.h"
+#include <lib/cleanup.bpf.h>
 
 char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
+
+/*
+ * Cgroup filtering plumbing (Task 3 of scx_invariant PLAN.md).
+ *
+ * cgroup_filtering: master gate. If false, is_target_task always returns
+ *                   true, so system-wide mode remains the default.
+ * target_cgid:      inode of the target cgroupv2 directory. Resolved to a
+ *                   struct cgroup * on each callback via bpf_cgroup_from_id().
+ *
+ * We do NOT cache the cgroup pointer across callbacks: sched_ext struct_ops
+ * programs have no clean place to stash a ref-counted cgroup ptr. The
+ * three-helper cost (from_id + under_cgroup + release-via-__free) is
+ * acceptable on the gated path.
+ *
+ * __free(cgroup) invokes bpf_cgroup_release on scope exit, handling NULL
+ * safely per DEFINE_FREE in lib/cleanup.bpf.h.
+ */
+const volatile bool cgroup_filtering = false;
+const volatile u64 target_cgid = 0;
+
+extern long bpf_task_under_cgroup(struct task_struct *task, struct cgroup *ancestor) __ksym;
+
+static __always_inline bool is_target_task(struct task_struct *p)
+{
+	if (!cgroup_filtering)
+		return true;
+	if (!p)
+		return false;
+
+	struct cgroup *cg __free(cgroup) = bpf_cgroup_from_id(target_cgid);
+	if (!cg)
+		return false;
+
+	return bpf_task_under_cgroup(p, cg) != 0;
+}
 
 /* Task-local storage */
 struct task_ctx {
@@ -107,6 +143,11 @@ static __always_inline void rb_drop_inc(void)
 s32 BPF_STRUCT_OPS(invariant_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
+	/* Drop waker attribution for tasks outside the target cgroup.
+	 * Scheduling decision is preserved: we still return prev_cpu below. */
+	if (!is_target_task(p))
+		return prev_cpu;
+
 	struct task_ctx *tctx = bpf_task_storage_get(
 		&task_ctx_map, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (!tctx)
@@ -122,11 +163,16 @@ s32 BPF_STRUCT_OPS(invariant_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 void BPF_STRUCT_OPS(invariant_enqueue, struct task_struct *p, u64 enq_flags)
 {
+	/* Scheduling operation — intentionally NOT cgroup-gated. Gating here
+	 * would drop tasks outside the target cgroup from being dispatched. */
 	scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
 }
 
 void BPF_STRUCT_OPS(invariant_running, struct task_struct *p)
 {
+	if (!is_target_task(p))
+		return;
+
 	struct task_ctx *tctx = bpf_task_storage_get(
 		&task_ctx_map, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (!tctx)
@@ -175,6 +221,9 @@ void BPF_STRUCT_OPS(invariant_running, struct task_struct *p)
 
 void BPF_STRUCT_OPS(invariant_stopping, struct task_struct *p, bool runnable)
 {
+	if (!is_target_task(p))
+		return;
+
 	struct task_ctx *tctx = bpf_task_storage_get(&task_ctx_map, p, 0, 0);
 	if (!tctx)
 		return;
@@ -210,6 +259,9 @@ void BPF_STRUCT_OPS(invariant_stopping, struct task_struct *p, bool runnable)
 
 void BPF_STRUCT_OPS(invariant_runnable, struct task_struct *p, u64 enq_flags)
 {
+	if (!is_target_task(p))
+		return;
+
 	struct task_ctx *tctx = bpf_task_storage_get(
 		&task_ctx_map, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (!tctx)
@@ -241,6 +293,9 @@ void BPF_STRUCT_OPS(invariant_runnable, struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(invariant_quiescent, struct task_struct *p, u64 deq_flags)
 {
+	if (!is_target_task(p))
+		return;
+
 	struct task_ctx *tctx = bpf_task_storage_get(&task_ctx_map, p, 0, 0);
 	if (!tctx)
 		return;

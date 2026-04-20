@@ -28,6 +28,8 @@ If `work/task.md` is empty, stop and request task details from the human operato
 
 ## Execution loop
 
+We MUST use sub-agent development pattern with Test Driven Development mode.
+
 1. Restate task constraints from `work/task.md`.
 2. Identify affected files and smallest safe change.
 3. Implement incrementally.
@@ -42,3 +44,6 @@ If `work/task.md` is empty, stop and request task details from the human operato
 - Formatting and build checks pass (or failures are explained with evidence).
 - Trace compatibility impacts are documented.
 
+## MUST NOT
+- Commit by yourself
+- When you finish a partial of the work, stop and report that you finish your task and claude code will review for you
