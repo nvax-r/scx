@@ -39,9 +39,19 @@ struct evt_running {
     u32 waker_pid;
     u32 waker_tgid;
     u16 waker_flags;
-    u16 cpu_perf;
+    u16 cpu_perf;            /* normalized [1, SCX_CPUPERF_ONE] hint */
     s32 prev_cpu;
     u64 wake_flags;
+    /*
+     * pmc_* below are RESERVED-ZERO in evt_running.
+     *
+     * Per-quantum counter deltas live exclusively in evt_stopping.
+     * Putting raw start-of-quantum snapshots here would mean the same
+     * field name carried two different physical units across event
+     * types in this shared format — a footgun for any aggregator that
+     * sums across all events. Slots are kept for format stability;
+     * writers MUST emit zeros and readers SHOULD ignore.
+     */
     u64 pmc_instructions;
     u64 pmc_cycles;
     u64 pmc_l2_misses;

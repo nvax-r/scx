@@ -345,6 +345,132 @@ def main():
             )
         print()
 
+    # PMU analysis (from RUNNING + STOPPING events).
+    #
+    # Producer: src/bpf/main.bpf.c populates evt->pmc_* via
+    # bpf_perf_event_read_value() against four BPF_MAP_TYPE_PERF_EVENT_ARRAY
+    # maps wired up from src/pmu.rs. evt->cpu_perf comes from
+    # scx_bpf_cpuperf_cur(cpu) and lives in [1, 1024] (SCX_CPUPERF_ONE).
+    #
+    # Per Phase-1 design, the reader does not aggregate these into a model
+    # of the workload — it just confirms the recording pipeline filled
+    # them in. Real analysis is Phase 2.
+    pmu_total = {"pmc_instructions": 0, "pmc_cycles": 0,
+                 "pmc_l2_misses": 0, "pmc_stall_backend": 0}
+    pmu_nonzero = {"pmc_instructions": 0, "pmc_cycles": 0,
+                   "pmc_l2_misses": 0, "pmc_stall_backend": 0}
+    pmu_stopping_total = 0
+    pmu_stopping_nonzero_cycles = 0
+
+    # Per-thread PMU aggregates (from STOPPING — that's where the per-quantum
+    # delta lives). RUNNING carries the start snapshot, useful for sanity
+    # but not for aggregation.
+    thr_pmc_inst = defaultdict(int)
+    thr_pmc_cyc = defaultdict(int)
+    thr_pmc_l2 = defaultdict(int)
+    thr_pmc_stall = defaultdict(int)
+
+    cpu_perf_min = None
+    cpu_perf_max = 0
+    cpu_perf_sum = 0
+    cpu_perf_count = 0
+    sample_running = []   # capture first few non-zero ones
+    sample_stopping = []
+
+    for evt_type, payload in raw_events:
+        parsed = parse_event(evt_type, payload)
+        if not parsed:
+            continue
+
+        if evt_type == EVT_RUNNING:
+            cp = parsed.get("cpu_perf", 0)
+            if cp:
+                cpu_perf_min = cp if cpu_perf_min is None else min(cpu_perf_min, cp)
+                cpu_perf_max = max(cpu_perf_max, cp)
+                cpu_perf_sum += cp
+                cpu_perf_count += 1
+            # evt_running.pmc_* are RESERVED-ZERO in this format —
+            # per-quantum counter deltas live in evt_stopping. Sample
+            # RUNNING events for cpu_perf only.
+            if len(sample_running) < 3 and cp:
+                sample_running.append(parsed)
+
+        elif evt_type == EVT_STOPPING:
+            pmu_stopping_total += 1
+            cyc = parsed.get("pmc_cycles", 0)
+            if cyc:
+                pmu_stopping_nonzero_cycles += 1
+            for k in pmu_total:
+                v = parsed.get(k, 0)
+                pmu_total[k] += v
+                if v:
+                    pmu_nonzero[k] += 1
+            pid = parsed["pid"]
+            thr_pmc_inst[pid]  += parsed.get("pmc_instructions", 0)
+            thr_pmc_cyc[pid]   += parsed.get("pmc_cycles", 0)
+            thr_pmc_l2[pid]    += parsed.get("pmc_l2_misses", 0)
+            thr_pmc_stall[pid] += parsed.get("pmc_stall_backend", 0)
+            if len(sample_stopping) < 3 and cyc:
+                sample_stopping.append(parsed)
+
+    print("=== PMU Summary ===")
+    if cpu_perf_count:
+        avg = cpu_perf_sum // cpu_perf_count
+        print(f"  cpu_perf (RUNNING):  min={cpu_perf_min}  max={cpu_perf_max}  "
+              f"avg={avg}  (non-zero in {cpu_perf_count}/{type_counts[EVT_RUNNING]})")
+    else:
+        print(f"  cpu_perf (RUNNING):  no non-zero samples "
+              f"(of {type_counts[EVT_RUNNING]}) — scx_bpf_cpuperf_cur returned 0")
+    if pmu_stopping_total:
+        pct = 100.0 * pmu_stopping_nonzero_cycles / pmu_stopping_total
+        print(f"  STOPPING events with non-zero pmc_cycles: "
+              f"{pmu_stopping_nonzero_cycles}/{pmu_stopping_total} ({pct:.1f}%)")
+    print(f"  {'counter':<22} {'total':>22}  {'non-zero events':>16}")
+    print(f"  {'-'*22} {'-'*22}  {'-'*16}")
+    for k in ("pmc_instructions", "pmc_cycles", "pmc_l2_misses", "pmc_stall_backend"):
+        print(f"  {k:<22} {pmu_total[k]:>22,}  {pmu_nonzero[k]:>16}")
+    if pmu_total["pmc_cycles"]:
+        ipc = pmu_total["pmc_instructions"] / pmu_total["pmc_cycles"]
+        print(f"  Aggregate IPC (instr / cycles):      {ipc:>6.3f}")
+        if pmu_total["pmc_instructions"]:
+            mpki = (pmu_total["pmc_l2_misses"] * 1000.0) / pmu_total["pmc_instructions"]
+            print(f"  Aggregate L2 misses per kilo-instr:  {mpki:>6.2f}")
+        stall_pct = 100.0 * pmu_total["pmc_stall_backend"] / pmu_total["pmc_cycles"]
+        print(f"  Backend-stall cycles / cycles:       {stall_pct:>5.1f}%")
+    print()
+
+    if sample_running or sample_stopping:
+        print("=== Sample PMU Events ===")
+        # RUNNING: only cpu_perf is meaningful (pmc_* reserved-zero).
+        for e in sample_running:
+            print(f"  RUNNING  pid={e['pid']:>6}  cpu={e['cpu']:>3}  "
+                  f"cpu_perf={e['cpu_perf']:>4}")
+        # STOPPING: per-quantum counter deltas plus derived IPC.
+        for e in sample_stopping:
+            ipc = e['pmc_instructions'] / e['pmc_cycles'] if e['pmc_cycles'] else 0.0
+            print(f"  STOPPING pid={e['pid']:>6}  cpu={e['cpu']:>3}  "
+                  f"runtime={format_ns(e['runtime_ns']):>9}  "
+                  f"inst={e['pmc_instructions']:>14,}  cyc={e['pmc_cycles']:>14,}  "
+                  f"IPC={ipc:>5.2f}  l2={e['pmc_l2_misses']:>8,}  "
+                  f"stall={e['pmc_stall_backend']:>12,}")
+        print()
+
+    if thr_pmc_inst:
+        print("=== Top 20 Threads by Instructions Retired ===")
+        top = sorted(thr_pmc_inst.items(), key=lambda x: x[1], reverse=True)[:20]
+        print(f"  {'PID':>8}  {'Name':<16} {'Instructions':>16}  {'Cycles':>16}  "
+              f"{'IPC':>6}  {'L2/Kinst':>8}  {'Stall%':>6}")
+        print(f"  {'-'*8}  {'-'*16} {'-'*16}  {'-'*16}  {'-'*6}  {'-'*8}  {'-'*6}")
+        for pid, ins in top:
+            cyc = thr_pmc_cyc[pid]
+            ipc = ins / cyc if cyc else 0.0
+            mpki = (thr_pmc_l2[pid] * 1000.0) / ins if ins else 0.0
+            stallp = (100.0 * thr_pmc_stall[pid] / cyc) if cyc else 0.0
+            name = procs.get(pid, "?")
+            print(f"  {pid:>8}  {name:<16} {ins:>16,}  {cyc:>16,}  "
+                  f"{ipc:>6.2f}  {mpki:>8.2f}  {stallp:>5.1f}%")
+        print()
+
     # Sleep duration analysis (from RUNNABLE events)
     thread_sleep_total = defaultdict(int)
     thread_sleep_count = defaultdict(int)

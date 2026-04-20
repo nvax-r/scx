@@ -2,6 +2,240 @@
 
 Chronological record of completed changes.
 
+## 2026-04-20: Drop dead-branch `Option<Pmu>` (reviewer M2)
+
+- Task: address reviewer M2 on the Task 5 PMU integration —
+  `Scheduler._pmu: Option<pmu::Pmu>` advertised "PMU init may be
+  absent" while the runtime path used `?` to hard-fail on init,
+  contradicting `work/task.md` Approach D ("the recorder must
+  always start, even with PMU disabled"). The `None` arm of the
+  `Option` was unreachable by construction.
+- Files changed:
+  - `scheds/rust/scx_invariant/src/pmu.rs` — `Pmu::open` and
+    `Pmu::install` are now infallible (`-> Self`, `-> ()`
+    respectively). `Pmu::open` body was already failure-free; the
+    `Result` return there was dead-branch and is just narrowed.
+    `Pmu::install` now demotes `bpf_map_update_elem` errors
+    (`ENOMEM`, `EINVAL`, `E2BIG`) to a per-counter warn log (one
+    per counter at most, with the first error string and ok/failed
+    counts) and leaves the failed slot unset — BPF reads return 0
+    for that (counter, cpu), matching the per-CPU `perf_event_open`
+    failure path. `pmu::open_and_install` becomes a two-line
+    infallible wrapper. Dropped `anyhow::{Context, Result}` import
+    (no longer used in this file).
+  - `scheds/rust/scx_invariant/src/main.rs` — `Scheduler._pmu:
+    pmu::Pmu` (was `Option<pmu::Pmu>`); doc-comment rewritten to
+    explain the now-aligned type/runtime contract.
+    `Scheduler::init` call site reduced to `let pmu =
+    pmu::open_and_install(&skel, nr_cpus);` (no `?`, no
+    `.context`). `anyhow::Context` import retained — still used
+    by cgroup/topology/ctrlc setup elsewhere in the file.
+- Behavior impact:
+  - Happy path: identical (no observable change).
+  - Unhappy path (`bpf_map_update_elem` failure on one or more
+    CPUs): previously aborted the recorder. Now logs a single warn
+    per affected counter (e.g. `"PMU counter 'cycles' map install:
+    142 ok, 2 failed (...); failed CPUs will record 0"`) and the
+    recorder continues. Failed (counter, cpu) slots produce zero
+    in the trace, same semantics as the per-CPU
+    `perf_event_open`-denied path.
+- Validation performed:
+  - `cargo check -p scx_invariant` (with touch on `main.bpf.c` to
+    force BPF rebuild) — success, only the pre-existing
+    `event_count` warning. Lints clean (ReadLints).
+  - `cargo fmt --check` — five pre-existing diffs only
+    (`cgroup.rs:83/133`, `main.rs:32/189`, `output.rs:71`); zero
+    new diffs from this fix.
+- Risks or follow-ups:
+  - The `info!("PMU events installed for {} CPUs", nr_cpus)` log
+    in `Scheduler::init` may now read as misleading when
+    `Pmu::install` partially failed (the per-counter warn already
+    surfaces that, but a reader scanning only info-level logs
+    might miss it). Left as-is; documented in `work/notes.md`.
+  - Runtime gates from `work/task.md` (smoke + IPC sanity, plus
+    explicit gate 6 — paranoid=3, no CAP_PERFMON degradation
+    test) still owed by the operator before merge. M2 makes
+    gate 6 strictly more achievable since map-install failures
+    no longer abort either.
+
+## 2026-04-20: Reserved-zero pmc_* in evt_running (reviewer M1)
+
+- Task: address reviewer M1 on the Task 5 PMU integration —
+  `evt_running.pmc_*` carried raw start-of-quantum CPU lifetime
+  snapshots while `evt_stopping.pmc_*` carried per-quantum deltas.
+  Same field name, two physical units in a shared on-disk format.
+  A naive "sum pmc_instructions across all events" aggregator would
+  silently double-count.
+- Files changed:
+  - `scheds/rust/scx_invariant/src/bpf/main.bpf.c` —
+    `invariant_running` still calls `read_pmc()` for all four
+    counters and stores the snapshots in `tctx->pmc_*_start` (still
+    needed by `invariant_stopping` for the delta), but now writes
+    **zeros** into `evt->pmc_*` instead of the raw snapshots.
+    `evt->cpu_perf` stays populated (it's a normalized standalone-
+    meaningful value, not a counter). Surrounding comment block
+    rewritten to lock in the contract: pmc_* deltas live exclusively
+    in evt_stopping; future maintainers must not start populating
+    evt_running's pmc_* slots.
+  - `scheds/rust/scx_invariant/src/bpf/intf.h` — `evt_running`'s
+    four `pmc_*` fields documented as RESERVED-ZERO with the full
+    rationale; one-line comment added to `cpu_perf` clarifying its
+    [1, SCX_CPUPERF_ONE] range.
+  - `scheds/rust/scx_invariant/analysis/reader.py` — "Sample PMU
+    Events" block previously sampled the first 3 RUNNING events with
+    non-zero `pmc_cycles`, which would never trigger after this
+    change. Now samples first 3 RUNNING events with non-zero
+    `cpu_perf` and prints `cpu_perf` only (no `pmc_*`). STOPPING
+    samples and the aggregate tables (PMU Summary, Top 20 by
+    Instructions Retired) are unchanged — they were already
+    correctly sourced from STOPPING only.
+- Behavior impact:
+  - On-disk format unchanged; payload sizes identical.
+  - `evt_running.pmc_*` is always zero in new traces. Older traces
+    remain readable; the updated reader ignores those slots.
+  - No double-counting risk in any future "iterate all events" sum.
+  - `evt_stopping.pmc_*` (the per-quantum deltas) and
+    `evt_running.cpu_perf` are unaffected.
+- Validation performed:
+  - `cargo check -p scx_invariant` (with touch on `main.bpf.c` and
+    `intf.h` to bypass the cargo build-script fingerprint cache) —
+    success, only the pre-existing `event_count` warning. BPF
+    recompiled.
+  - `python3 -c "import ast; ast.parse(...)"` on reader.py — OK.
+- Risks or follow-ups:
+  - Any third-party reader that opportunistically diffed
+    evt_running.pmc_* across event pairs on the same CPU loses that
+    capability. Such a reader was already incorrect (cross-task /
+    cross-time interleaving misattributes work) — strictly an
+    improvement.
+  - Runtime gates from `work/task.md` (smoke + IPC sanity) still
+    owed by the operator before merge.
+
+## 2026-04-20: Saturating PMC delta (reviewer H1, post-Task-5)
+
+- Task: address reviewer block H1 on the Task 5 PMU integration —
+  u64 underflow in `evt->pmc_*` when `read_pmc()` returns 0 at
+  `invariant_stopping` while `tctx->pmc_*_start` was non-zero.
+  Failure modes: transient `bpf_perf_event_read_value` failure
+  (multiplexing pause, ARM PMU power-state, any kfunc < 0), or
+  `running` skipped while `stopping` fires due to kernel
+  SCX_TASK_QUEUED pairing race. Naive subtraction wraps to ~1.84e19
+  and poisons any downstream aggregator.
+- Files changed:
+  - `scheds/rust/scx_invariant/src/bpf/main.bpf.c` — added
+    `static __always_inline u64 sat_sub(u64 end, u64 start)` next to
+    `read_pmc()`; `invariant_stopping` calls `sat_sub()` for all four
+    `pmc_*` delta writes; updated the surrounding comment block to
+    enumerate both failure modes the helper guards against.
+- Behavior impact:
+  - When `end < start`, the trace records `0` for that counter delta
+    instead of ~UINT64_MAX. Same semantics as the start-side
+    "counter unavailable" path, so the reader treats both as "no PMU
+    data this quantum".
+  - No format change. Happy-path values unchanged. No verifier risk
+    (compare + branch only).
+  - The stale-`tctx` desync case (case 2 in `work/notes.md`) is only
+    partly addressed — `sat_sub` kills the underflow but not the
+    stale-start inflation. Proper fix is a per-quantum generation
+    bit on `task_ctx`; deferred per `work/notes.md`.
+- Validation performed:
+  - `cargo check -p scx_invariant` — success, only the pre-existing
+    `event_count` warning. BPF recompiled (touched the .c to bypass
+    cargo's build-script fingerprint cache).
+- Risks or follow-ups:
+  - Generation-bit fix for the stale-`tctx` case (also affects
+    pre-existing `runtime_ns` inflation; better fixed in one pass).
+  - Optional percpu counter for sat-sub trigger rate, to spot any
+    real-world cases in production.
+  - Runtime gates from `work/task.md` (smoke + IPC sanity) still
+    owed by the operator before merge — same as the original Task 5
+    handoff.
+
+## 2026-04-20: PMU integration (Task 5)
+
+- Task: per-quantum hardware-counter deltas in EVT_RUNNING / EVT_STOPPING
+  plus real `cpu_perf` from `scx_bpf_cpuperf_cur()`. Replaces the four
+  `pmc_*` zero placeholders (`main.bpf.c:199,203-206,245-248` pre-task)
+  with system-wide CPU-pinned `perf_event_open` reads via four BPF
+  perf-event-array maps. Trace format unchanged — slots already existed.
+- Files changed:
+  - `scheds/rust/scx_invariant/src/pmu.rs` (new, ~170 LOC) — `Pmu`
+    holding owned per-(counter, cpu) fds, `Pmu::open(nr_cpus)` that
+    swallows per-CPU and per-counter open failures with one log each,
+    `Pmu::install(&BpfSkel)` that pushes fds into the four perf-event
+    arrays, and `pmu::open_and_install(skel, nr_cpus)` convenience
+    wrapper. Uses `scx_utils::perf` (already a workspace dep) for the
+    `perf_event_open` syscall and bindings.
+  - `scheds/rust/scx_invariant/src/bpf/main.bpf.c` — four
+    `BPF_MAP_TYPE_PERF_EVENT_ARRAY` maps (`pmu_instructions`,
+    `pmu_cycles`, `pmu_l2_misses`, `pmu_stall_backend`) with
+    `max_entries = SCX_INVARIANT_MAX_CPUS = 1024` (generous static
+    upper bound); `read_pmc()` helper using
+    `bpf_perf_event_read_value` with errors mapped to 0;
+    `invariant_running` now snapshots all four counters into the
+    pre-existing `tctx->pmc_*_start` slots and writes
+    `evt->cpu_perf = (u16)scx_bpf_cpuperf_cur(cpu)` plus the start
+    values into `evt_running`'s `pmc_*` fields; `invariant_stopping`
+    now writes per-quantum deltas (`end - start`).
+  - `scheds/rust/scx_invariant/src/main.rs` — `mod pmu;`, `Scheduler`
+    gains `_pmu: Option<pmu::Pmu>`, `Scheduler::init` takes a
+    `nr_cpus: u16` parameter and runs `pmu::open_and_install` between
+    `scx_ops_load!` and `scx_ops_attach!`, single call-site update
+    in `main()`.
+  - `scheds/rust/scx_invariant/PLAN.md` — Task 5 flipped to Done in
+    §9 roadmap, recommended-next-order list trimmed to Task 7, §2
+    diagram drops `(planned)` next to `runnable` / `quiescent` /
+    `select_cpu`, §8 Future-additions block reframed as "now in tree".
+- Behavior impact:
+  - Trace files now carry **real** PMU counts in EVT_RUNNING (start
+    snapshots) and EVT_STOPPING (per-quantum deltas). Older traces
+    where these fields were zero remain readable; reader.py needs no
+    changes.
+  - `evt_running.cpu_perf` is no longer zero — populated from
+    `scx_bpf_cpuperf_cur(cpu)` in [1, 1024] (SCX_CPUPERF_ONE).
+  - On a host without PMU access (`perf_event_paranoid >= 2` and no
+    `CAP_PERFMON`), the recorder still starts and records zeros for
+    PMU fields — single info log per failed counter, single warn log
+    if a counter is partially available.
+  - No scheduling policy changes; `enqueue` still passthrough to
+    `SCX_DSQ_GLOBAL`, `select_cpu` still returns `prev_cpu`. All PMU
+    reads are gated by the existing `is_target_task(p)` check at the
+    top of `running` / `stopping`.
+- Deviation from `work/task.md`:
+  - task spec puts `Pmu::install` between `scx_ops_open!` and
+    `scx_ops_load!`. That can't work — `bpf_map_update_elem` needs a
+    real map fd, which only exists post-load. Moved to between
+    `scx_ops_load!` and `scx_ops_attach!`, matching what
+    `scx_layered::create_perf_fds` and `scx_cosmos::setup_perf_events`
+    do. Maps are still populated before any callback can fire.
+    Rationale documented in `work/notes.md` 2026-04-20 PMU entry.
+- Validation performed:
+  - `cargo check -p scx_invariant` — success, 1 pre-existing
+    `event_count` warning.
+  - `cargo build --profile ci --locked -p scx_invariant` — success
+    (BPF compiled, four perf-event-array maps and `read_pmc` linked).
+  - `cargo fmt -p scx_invariant -- --check` — five pre-existing diffs
+    only (`cgroup.rs:83`, `cgroup.rs:133`, `main.rs:32`,
+    `main.rs:189`, `output.rs:71`); none introduced by this task.
+  - Cross-checked `scx_bpf_cpuperf_cur` return type and range against
+    `kernel/sched/ext.c:9076` and `kernel/sched/ext_internal.h:20`
+    in `~/upstream-kernel`; verified `SCHED_CAPACITY_SCALE = 1024`
+    fits u16. Verified ARMv8 PMUv3 event codes
+    (`L2D_CACHE_REFILL=0x17`, `STALL_BACKEND=0x24`) against
+    `include/linux/perf/arm_pmuv3.h`. Verified `armv8_pmuv3_0` is
+    present under `/sys/bus/event_source/devices/`.
+- Risks or follow-ups:
+  - Runtime validation gates 3–7 in `work/task.md` (smoke run with
+    stress-ng, IPC sanity, PMU-unavailable degradation, cgroup-scope
+    regression, system-wide regression) require sudo + a sched_ext-
+    capable kernel and were not run from the sandbox. Owed by the
+    operator before merge.
+  - x86 / non-aarch64 event encodings intentionally out of scope per
+    task spec.
+  - Multiplexing scaling deferred until measurement shows divergence;
+    `read_pmc()` already uses `bpf_perf_event_read_value` so
+    `enabled`/`running` are available without an ABI change.
+
 ## 2026-04-20: Implement userspace half of cgroup filtering (Task 3, spawn-only)
 
 - Task: deliver the userspace half of `work/task.md` (cgroup-based
