@@ -2,6 +2,61 @@
 
 Chronological record of completed changes.
 
+## 2026-04-22: SCXI format bumped to v2 — events out of section-ID space
+
+- Task: fix the structural ID collision between section IDs
+  (`0x0001..0x0003`) and event IDs (`1..5`) in the v1 `.scxi` format.
+  The v1 reader compensated with a payload-size heuristic that broke
+  silently on any trace with exactly two PIDs in the process table
+  (40-byte `SECTION_PROCS` payload mis-decoded as a phantom
+  `EVT_RUNNABLE`). Fixed at the format level, not by adding more
+  heuristics.
+- Files changed:
+  - `scheds/rust/scx_invariant/src/bpf/intf.h` — renumbered
+    `enum scx_invariant_event_type` to `0x0100..0x0104`
+    (`EVT_RUNNING`/`STOPPING`/`RUNNABLE`/`QUIESCENT`/`TICK`). Added
+    a comment block reserving `0x0001..0x00FF` for sections.
+    No struct-size or field-layout changes.
+  - `scheds/rust/scx_invariant/src/bpf/main.bpf.c` — no source edit;
+    all four producer sites already used the enum names. The new
+    values flow in via the `bpf_intf.rs` rebuild.
+  - `scheds/rust/scx_invariant/src/output.rs` — bumped
+    `const VERSION: u16 = 1;` → `2;` with an explanatory comment.
+    No writer-side translation shim, no remap table.
+  - `scheds/rust/scx_invariant/analysis/reader.py` — three
+    coordinated changes:
+    - `EVT_*` constants renumbered to `0x0100..0x0104`.
+    - Loose `KNOWN_SIZES = {88,40,32,64}` replaced with strict
+      per-type `EVT_SIZES`; a candidate event TLV must match both
+      a known type AND its exact ABI size.
+    - `read_header` rejects any non-v2 file via new
+      `UnsupportedVersionError` (a `ValueError` subclass) with an
+      explicit message naming both versions. v1 has no decode path.
+  - `scheds/rust/scx_invariant/analysis/test_reader.py` — new
+    stdlib-only regression test:
+    - Case A: synthesizes a v2 trace with the v1 collision shape
+      (two PIDs in process table) and asserts no phantom event.
+    - Case B: synthesizes a v1 header and asserts the reader
+      rejects it fast with `UnsupportedVersionError`.
+    - Run: `python3 scheds/rust/scx_invariant/analysis/test_reader.py`
+  - `scheds/rust/scx_invariant/PLAN.md` — §5 known-issue paragraph
+    replaced; §6 event-table values bumped to `0x0100+`; §11 TLV
+    rationale rewritten to scope forward-compat to within a major
+    version and document the major-version field as the hard-break
+    escape hatch.
+  - `work/notes.md` — appended root cause, fix, hard-break decision,
+    test design, and PLAN.md edit summary.
+- Trace format: deliberate hard break. `.scxi` is now v2-only in
+  this tree; v1 traces are intentionally unsupported by the in-tree
+  reader. Event payload layouts and section framing unchanged —
+  only the file `version` field and event-ID numeric space change.
+- Risks or follow-ups:
+  - Any out-of-tree consumer of v1 `.scxi` traces will need its own
+    decoder pin or regeneration. The repo carries no such consumer.
+  - The strict `EVT_SIZES` check will fail loudly if any future ABI
+    change resizes an event without updating both the C struct in
+    `intf.h` and the table in `reader.py` — by design.
+
 ## 2026-04-22: Task 7 follow-up — drop `is_target_task(p)` gate from `invariant_tick` (reviewer M1)
 
 - Task: address reviewer M1 on the just-landed Task 7 hook —

@@ -7,7 +7,11 @@ use anyhow::{Context, Result};
 use log::info;
 
 const MAGIC: &[u8; 4] = b"SCXI";
-const VERSION: u16 = 1;
+/// SCXI on-disk format version. v2 moved event IDs out of the
+/// section-ID numeric space (events now live at 0x0100+, sections
+/// stay at 0x0001..0x0003) — see PLAN.md §5/§11. v1 is intentionally
+/// unsupported by the in-tree reader.
+const VERSION: u16 = 2;
 const ARCH_AARCH64: u16 = 1;
 
 const SECTION_TOPOLOGY: u16 = 0x0001;

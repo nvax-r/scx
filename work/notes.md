@@ -466,3 +466,114 @@ Cost change in spawn mode: ~36k tick events/sec system-wide on a
 0. Not measurable in either direction, but the reviewer's
 "cargo-culted cost" framing is correct on principle. Ship the
 cheaper version.
+
+## 2026-04-22 — SCXI v2 format break: events out of section-ID space
+
+### Root cause (v1)
+
+`src/output.rs` defines section IDs at `0x0001..0x0003`
+(`SECTION_TOPOLOGY`, `SECTION_PROCS`, `SECTION_EVENTS`).
+`src/bpf/intf.h` (v1) defined event IDs at `1..5`. Same numeric space.
+
+The two framings are also different widths:
+
+- Section header: `[type:u16][len:u32]` = 6 bytes.
+- Event TLV: `[type:u16][payload_len:u16][payload]` = 4-byte prefix.
+
+So the reader, walking the events section, had to decide on each
+4-byte read "is this another event TLV, or have I just stepped into
+the next section header?" with only the `u16` type to go on — and
+the type numbers overlapped. To compensate, the v1 reader added a
+payload-size heuristic (`KNOWN_SIZES = {88, 40, 32, 64}`): accept
+the type if the size is in the set.
+
+That heuristic fails for the **two-PID process table**. A `procs`
+entry is `pid:u32 + comm[16]` = 20 bytes. Two procs = 40-byte
+section payload. `40` is exactly `evt_runnable`'s size. The reader
+sees `[0x0002][?]` followed by 40 bytes of proc data and either
+mis-reads the `SECTION_PROCS` header as an event TLV or — once
+inside — accepts the section payload as a phantom `EVT_RUNNABLE`.
+Either way, the trace is silently mis-decoded on small workloads.
+
+### Fix (v2)
+
+Renumber event IDs to `0x0100..0x0104`:
+
+- `EVT_RUNNING   = 0x0100`
+- `EVT_STOPPING  = 0x0101`
+- `EVT_RUNNABLE  = 0x0102`
+- `EVT_QUIESCENT = 0x0103`
+- `EVT_TICK      = 0x0104`
+
+Section IDs stay at `0x0001..0x0003`. The two namespaces are now
+disjoint by construction; a `u16` type read inside the events
+section can only be an event TLV (≥ 0x0100) or the start of the
+next section header (≤ 0x00FF). No heuristic needed for the type
+check — but the reader still enforces an exact per-type size
+(`EVT_SIZES`) as belt-and-braces against future ABI drift.
+
+### Decision: drop v1 reader support
+
+Hard break. The in-tree reader checks file header `version != 2`
+and raises `UnsupportedVersionError` (a `ValueError` subclass) with
+a clear message. No dual-version decode path. No writer-side
+translation shim that would re-introduce the problem.
+
+Rationale: keeping a v1 path costs more than re-reading old traces
+ever could. v1 traces are silently buggy on the two-PID shape; we
+do not want any pipeline accidentally relying on those decodes.
+Anyone with a real v1 trace can pin to the prior commit of
+`reader.py` (or just regenerate — these are profiling traces,
+ephemeral by design).
+
+### Producer-side change is one line in C
+
+`main.bpf.c` already references the enum by name in all four
+`evt->hdr.event_type = EVT_*` sites — no literals. Renumbering
+`intf.h` is therefore the entire producer-side change; the BPF
+program picks up the new values on rebuild via `bpf_intf.rs`
+(auto-generated).
+
+### Tests
+
+New `analysis/test_reader.py` covers two cases the spec calls out:
+
+- **Case A** synthesizes a v2 trace with exactly two PIDs in the
+  process table (the v1 collision shape) and asserts:
+  - `procs` decodes to exactly 2 entries
+  - `events` decodes to exactly the one `EVT_RUNNABLE` written
+    (no phantom event from misreading the procs section)
+  - topology survives
+- **Case B** synthesizes a v1-headered file and asserts:
+  - `read_header` raises `UnsupportedVersionError`
+  - the message names both v1 and v2 explicitly
+  - the exception is also catchable as `ValueError` (subclass)
+
+The synthetic traces are built with stdlib `struct` only; no test
+fixtures committed. Width constants are duplicated locally in the
+test on purpose — if anyone changes the on-disk layout without
+updating the test, this file fails loudly.
+
+### Validation gate 6 ("reject a v1 trace")
+
+The spec said "any old v1 trace is acceptable for this check". I
+don't have a v1 `.scxi` lying around in the workspace, so Case B
+of `test_reader.py` is what satisfies this gate: a synthetic v1
+header is the most reliable rejection input we can build, and it
+exercises the same `read_header` code path a real v1 file would
+hit on disk. If a real v1 trace shows up later, running it through
+`reader.py` should produce the same `UnsupportedVersionError`.
+
+### PLAN.md edits
+
+- §5 (`.scxi` Binary File Format): replaced the "Known issue" paragraph
+  about the ID collision with a paragraph stating v2 fixes it
+  structurally.
+- §6 (Event Types): bumped the event-ID column to `0x0100..0x0104`
+  and kept `EVT_TICK` as Reserved (Task 7 hook stays inert).
+- §11 (Why TLV event framing): rewrote to scope the
+  forward-compat property to *within a major version*, and
+  explicitly call out the major-version field as the escape hatch
+  for changes TLV cannot absorb. Future hard breaks should bump
+  the version, document the reason in §5/§11, and delete the
+  prior version's decode path — not branch on version.
