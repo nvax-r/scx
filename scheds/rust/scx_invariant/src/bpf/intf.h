@@ -12,12 +12,18 @@ typedef signed int s32;
 typedef signed long s64;
 #endif /* __VMLINUX_H__ */
 
+/*
+ * Event IDs live at 0x0100+ to stay structurally disjoint from
+ * section IDs (SECTION_* in src/output.rs, occupying 0x0001..0x0003).
+ * This is the v2 .scxi format invariant — see PLAN.md §5/§6/§11.
+ * Do not assign event IDs in the 0x0001..0x00FF range.
+ */
 enum scx_invariant_event_type {
-    EVT_RUNNING     = 1,
-    EVT_STOPPING    = 2,
-    EVT_RUNNABLE    = 3,
-    EVT_QUIESCENT   = 4,
-    EVT_TICK        = 5,
+    EVT_RUNNING     = 0x0100,
+    EVT_STOPPING    = 0x0101,
+    EVT_RUNNABLE    = 0x0102,
+    EVT_QUIESCENT   = 0x0103,
+    EVT_TICK        = 0x0104,
 };
 
 #define FLAG_MIGRATED       (1 << 0)

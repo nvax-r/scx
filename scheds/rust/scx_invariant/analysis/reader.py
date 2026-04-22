@@ -12,15 +12,20 @@ from pathlib import Path
 
 # --- File format constants ---
 MAGIC = b"SCXI"
+SUPPORTED_VERSION = 2  # v1 is intentionally unsupported (see PLAN.md §5/§11)
+
 SECTION_TOPOLOGY = 0x0001
 SECTION_PROCS    = 0x0002
 SECTION_EVENTS   = 0x0003
 
-EVT_RUNNING   = 1
-EVT_STOPPING  = 2
-EVT_RUNNABLE  = 3
-EVT_QUIESCENT = 4
-EVT_TICK      = 5
+# Event IDs live at 0x0100+ to stay structurally disjoint from section
+# IDs (0x0001..0x0003). This is the v2 invariant; do not reintroduce
+# event IDs in the section-ID range. See src/bpf/intf.h.
+EVT_RUNNING   = 0x0100
+EVT_STOPPING  = 0x0101
+EVT_RUNNABLE  = 0x0102
+EVT_QUIESCENT = 0x0103
+EVT_TICK      = 0x0104
 
 EVT_NAMES = {
     EVT_RUNNING:   "RUNNING",
@@ -28,6 +33,17 @@ EVT_NAMES = {
     EVT_RUNNABLE:  "RUNNABLE",
     EVT_QUIESCENT: "QUIESCENT",
     EVT_TICK:      "TICK",
+}
+
+# Exact per-type ABI payload size (full struct including 24-byte header).
+# A candidate event TLV must match BOTH a known type AND its exact size;
+# either alone admitted the v1 two-PID phantom-event bug.
+EVT_SIZES = {
+    EVT_RUNNING:   88,
+    EVT_STOPPING:  88,
+    EVT_RUNNABLE:  40,
+    EVT_QUIESCENT: 32,
+    EVT_TICK:      64,  # reserved in format; not emitted today (Task 7)
 }
 
 FLAG_MIGRATED    = 1 << 0
@@ -71,14 +87,24 @@ def decode_kernel_ver(v):
     return f"{major}.{minor}.{patch}"
 
 
+class UnsupportedVersionError(ValueError):
+    """Raised when the .scxi file header carries an unsupported version."""
+
+
 def read_header(data):
-    """Parse the 64-byte file header."""
+    """Parse the 64-byte file header. Rejects any version != SUPPORTED_VERSION."""
     if len(data) < 64:
         raise ValueError(f"File too small for header: {len(data)} bytes")
     if data[:4] != MAGIC:
         raise ValueError(f"Bad magic: {data[:4]!r} (expected {MAGIC!r})")
 
     version, header_size = struct.unpack_from("<HH", data, 4)
+    if version != SUPPORTED_VERSION:
+        raise UnsupportedVersionError(
+            f"Unsupported SCXI version: file is v{version}, "
+            f"this reader supports v{SUPPORTED_VERSION} only. "
+            f"v1 traces are intentionally not supported (see PLAN.md §5/§11)."
+        )
     flags, = struct.unpack_from("<I", data, 8)
     ts_start, ts_end = struct.unpack_from("<QQ", data, 12)
     hostname = data[28:56].split(b"\x00")[0].decode("utf-8", errors="replace")
@@ -126,20 +152,26 @@ def read_sections(data, offset):
                 offset += 16
 
         elif sec_type == SECTION_EVENTS:
-            # sec_len == 0 means until next section header or EOF
-            # We read TLV events: [event_type: u16][payload_len: u16][payload]
-            # Known event payload sizes (full struct including header)
-            KNOWN_SIZES = {88, 40, 32, 64}
+            # sec_len == 0 means "until next section header or EOF".
+            # Events are TLVs: [event_type: u16][payload_len: u16][payload].
+            #
+            # Strict v2 detection: a candidate event MUST be a known event
+            # type AND its payload_len MUST exactly match that type's ABI
+            # size. The v1 reader admitted any payload size in {88,40,32,
+            # 64}, which collided with a SECTION_PROCS payload of 40 bytes
+            # (exactly two procs) and silently parsed it as an EVT_RUNNABLE.
+            # In v2 event IDs (0x0100+) and section IDs (0x0001..0x0003) no
+            # longer share numeric space, so the type check alone is now
+            # decisive — but we still enforce the exact size as belt-and-
+            # braces against any future ABI drift.
             while offset + 4 <= len(data):
                 evt_type, payload_len = struct.unpack_from("<HH", data, offset)
 
-                # Detect section boundary: valid events have known payload sizes
-                # and event types 1-5.  If either is wrong, we hit the next section.
-                if evt_type not in (EVT_RUNNING, EVT_STOPPING, EVT_RUNNABLE,
-                                     EVT_QUIESCENT, EVT_TICK):
-                    break
-                if payload_len not in KNOWN_SIZES:
-                    break
+                expected = EVT_SIZES.get(evt_type)
+                if expected is None:
+                    break  # unknown type → next section header reached
+                if payload_len != expected:
+                    break  # ABI size mismatch → treat as section boundary
 
                 offset += 4
                 if offset + payload_len > len(data):

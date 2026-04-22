@@ -214,9 +214,13 @@ decoding offline.
 └──────────────────────────────────────────────────────────┘
 ```
 
-**Known issue**: event type IDs (1-5) collide with section type IDs (0x0001
-through 0x0003). The reader uses payload-size heuristics to disambiguate. Fix
-in v2 by renumbering event types to start at 0x0100.
+**v2 format**: event IDs live at `0x0100+` (see §6) and section IDs stay at
+`0x0001..0x0003`. The two namespaces no longer overlap, so a `u16` type read
+inside the events section is unambiguously either an event TLV or the next
+section header. The v1 payload-size heuristic that this fixed (and its
+two-PID phantom-event bug) is gone; the reader now requires both a known
+event type and an exact ABI size match. v1 traces are intentionally
+unsupported by the in-tree reader.
 
 ---
 
@@ -237,11 +241,11 @@ struct scx_invariant_event {
 
 | Type | Value | Total Size | Purpose | Status |
 |------|-------|-----------:|---------|--------|
-| EVT_RUNNING | 1 | 88 B | Task started executing on a CPU | Done |
-| EVT_STOPPING | 2 | 88 B | Task stopped executing | Done |
-| EVT_RUNNABLE | 3 | 40 B | Task became runnable (woke up) | Done |
-| EVT_QUIESCENT | 4 | 32 B | Task went to sleep | Done |
-| EVT_TICK | 5 | 64 B | Reserved in format; not emitted (see Task 7) | Reserved |
+| EVT_RUNNING | 0x0100 | 88 B | Task started executing on a CPU | Done |
+| EVT_STOPPING | 0x0101 | 88 B | Task stopped executing | Done |
+| EVT_RUNNABLE | 0x0102 | 40 B | Task became runnable (woke up) | Done |
+| EVT_QUIESCENT | 0x0103 | 32 B | Task went to sleep | Done |
+| EVT_TICK | 0x0104 | 64 B | Reserved in format; not emitted (see Task 7) | Reserved |
 
 Flags (`scx_invariant_event.flags`):
 - `FLAG_MIGRATED` (1<<0) — task is on a different CPU than last run
@@ -448,9 +452,21 @@ compilation cycle when adding new analysis.
 
 ### Why TLV event framing in the file?
 
-Each event has `[type: u16][len: u16]` prefix before its payload. This makes
-the format **forward-compatible**: a reader can skip event types it does not
-understand by jumping `len` bytes forward.
+Each event has `[type: u16][len: u16]` prefix before its payload. **Within a
+major file version** this makes the format forward-compatible: a v2 reader
+can skip event types it does not understand by jumping `len` bytes forward,
+so a producer that adds a new event type (say `EVT_TICK` payload at
+`0x0104`) does not break older v2 readers.
+
+The major version field in the file header (`output.rs::VERSION`) is the
+escape hatch for changes that TLV cannot absorb — header layout, section
+framing, or numeric-space realignments. v1 → v2 was exactly such a hard
+break (event IDs moved out of the section-ID space, see §5/§6). We
+deliberately did **not** keep a v1 compatibility path in the in-tree reader;
+the version field is checked at header parse time and any non-v2 file is
+rejected fast. If a future change requires another hard break, bump the
+version, document why here, and delete the prior version's decode path —
+do not add multi-version branching.
 
 ---
 
