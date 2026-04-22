@@ -2,6 +2,69 @@
 
 Chronological record of completed changes.
 
+## 2026-04-22: Task 7 follow-up — drop `is_target_task(p)` gate from `invariant_tick` (reviewer M1)
+
+- Task: address reviewer M1 on the just-landed Task 7 hook —
+  gating an empty body on `is_target_task(p)` runs a three-kfunc
+  chain (`bpf_cgroup_from_id` + `bpf_task_under_cgroup` +
+  `__free(cgroup)`) in spawn mode to produce a bool that is
+  immediately discarded. The gate's job is to short-circuit work;
+  with no work after it, the gate is cargo-culted cost.
+- Files changed:
+  - `scheds/rust/scx_invariant/src/bpf/main.bpf.c` — body of
+    `invariant_tick` is now `(void)p;` (true no-op). Comment above
+    the function tells future maintainers to add the
+    `is_target_task(p)` gate when they add real work, with the
+    rationale (gate exists to short-circuit, empty body has nothing
+    to short-circuit) inline.
+  - `work/notes.md` — appended follow-up section documenting the
+    spec deviation per `work/task.md`'s "stop and document why in
+    `work/notes.md` before proceeding further" clause. The deviation
+    is purely a cost-correctness tightening; observable behavior is
+    unchanged (hook is still inert), trace format unchanged, kernel
+    ABI match unchanged.
+- Trace format: unchanged. No PMU reads, no ringbuf reserve, no
+  events emitted. `EVT_TICK = 5` stays reserved in `intf.h`.
+- Risks or follow-ups:
+  - When a future task adds real work to `invariant_tick`, the
+    in-function comment must be honored: gate on `is_target_task(p)`
+    before the work, exactly like the sibling callbacks.
+
+## 2026-04-22: Task 7 — minimal `ops.tick()` plumbing (no-op hook)
+
+- Task: reserve the kernel `ops.tick()` callback in the `scx_invariant`
+  BPF scheduler without adding any recording behavior. Scope-cut from
+  the original "periodic PMU snapshots for long-running quanta" wording
+  to avoid creating a second PMU producer that would overlap Task 5's
+  `running` / `stopping` path.
+- Files changed:
+  - `scheds/rust/scx_invariant/src/bpf/main.bpf.c` — added
+    `invariant_tick(p)` matching the kernel ABI
+    (`void (*tick)(struct task_struct *p)` per
+    `kernel/sched/ext_internal.h:382`); body is `if (!is_target_task(p))
+    return;` and nothing else. Wired `.tick = (void *)invariant_tick`
+    into `SCX_OPS_DEFINE(invariant_ops, ...)` between `.running` and
+    `.stopping` to mirror lifecycle order.
+  - `scheds/rust/scx_invariant/PLAN.md` — §6 row marks `EVT_TICK` as
+    Reserved (was Pending); §7 prose drops the "remaining optional
+    addition" framing; §9 roadmap row reads "Minimal `ops.tick()` hook"
+    / Done; recommended-next-order paragraph emptied.
+  - `work/notes.md` — appended rescope rationale (PMU truth path stays
+    in `running`/`stopping`; `tick()` is not a precise quantum boundary;
+    hook is reserved for a separately-specified future design).
+- Trace format: unchanged. `intf.h`, `output.rs`, `analysis/reader.py`,
+  `recorder.rs`, `main.rs`, `pmu.rs`, `cgroup.rs` all untouched.
+  `EVT_TICK = 5` stays reserved in `intf.h` for a future spec.
+- Risks or follow-ups:
+  - Hook is intentionally inert; if a future task wants to record at
+    tick boundaries it must come with its own spec covering what is
+    recorded, why it isn't covered by `running`/`stopping`, and the
+    format-evolution plan for `EVT_TICK`.
+  - One indirect call per kernel scheduler tick on each SCX-running CPU
+    (vs. taking the `SCX_HAS_OP(sch, tick) == false` short-circuit
+    branch). Negligible — see `work/notes.md` 2026-04-22 for the
+    cost-of-hook check.
+
 ## 2026-04-20: Drop dead-branch `Option<Pmu>` (reviewer M2)
 
 - Task: address reviewer M2 on the Task 5 PMU integration —
