@@ -381,3 +381,88 @@ installed). Left as-is for now since `Pmu::install`'s own per-counter
 warn already surfaces partial failures; if it becomes a source of
 confusion, change to "PMU init complete; see prior warns for
 partial-failure detail" as a single-line tweak.
+
+## 2026-04-22 — Task 7 rescope: minimal `ops.tick()` hook only
+
+Original Task 7 wording in `PLAN.md` framed the work as "periodic PMU
+snapshots for long-running quanta", emitting an `EVT_TICK` carrying
+PMU deltas mid-quantum. That's the wrong shape for this branch:
+
+- Task 5 already established `running` / `stopping` as the single
+  source of PMU truth. Reading PMU counters again from `tick()` would
+  create a second producer with overlapping semantics — two values
+  for "instructions retired by this task" with subtly different
+  windowing rules. That is the kind of split-source-of-truth bug
+  that's unfixable two releases later.
+- `ops.tick()` in the kernel (verified in
+  `~/upstream-kernel/kernel/sched/ext_internal.h:374-382` and the
+  invocation in `kernel/sched/ext.c:3413` from `task_tick_scx`) is
+  *not* a precise quantum boundary. It fires every 1/HZ on a CPU
+  whose currently-running task is an SCX task. Treating it as a
+  PMU-quantum-boundary event would silently inherit that imprecision.
+- We don't yet know what *is* worth recording at a tick boundary that
+  isn't already covered by `running` / `stopping` + future syscall
+  tracking. Reserving the kernel hook keeps the option open without
+  guessing a format.
+
+So Task 7 in this branch is hook-only:
+
+- Add `invariant_tick(p)` matching the kernel ABI
+  (`void (*tick)(struct task_struct *p)`); body checks
+  `is_target_task(p)` and returns. No PMU reads. No ringbuf reserve.
+  No event emission.
+- Wire `.tick = (void *)invariant_tick` into `SCX_OPS_DEFINE`.
+- `intf.h`, `output.rs`, `recorder.rs`, `main.rs`, `pmu.rs`,
+  `cgroup.rs`, `analysis/reader.py` stay untouched. Trace format is
+  byte-identical. `EVT_TICK = 5` stays reserved in `intf.h` for a
+  future, separately-specified design.
+- `PLAN.md` updated: §6 row marks `EVT_TICK` as Reserved (not Pending);
+  §7 prose drops the "remaining optional addition" framing; §9
+  roadmap row reads "Minimal `ops.tick()` hook" / Done; the
+  recommended-next-order paragraph is emptied (no remaining roadmap
+  tasks).
+
+Cost-of-hook check: at HZ=250 on 144 CPUs with everything in SCX,
+the inert hook fires ~36k times/sec system-wide. With
+`cgroup_filtering == false` (system-wide mode) `is_target_task(p)`
+is one rodata load + immediate `true`. With filtering on it's three
+kfunc calls (`bpf_cgroup_from_id` + `bpf_task_under_cgroup` +
+`__free(cgroup)` release). Both are negligible — confirmed by
+inspection only; will be re-verified by smoke-run before sign-off.
+
+### Follow-up — reviewer M1: drop the `is_target_task(p)` gate
+
+Initial implementation followed `work/task.md` step 2 literally:
+`if (!is_target_task(p)) return;` then nothing. Reviewer M1 pushed
+back, correctly:
+
+- The gate's purpose is to short-circuit work. With no work after
+  it, there is nothing to short-circuit.
+- In spawn mode (`cgroup_filtering == true`) the gate runs the
+  three-kfunc chain — `bpf_cgroup_from_id` + `bpf_task_under_cgroup`
+  + `__free(cgroup)` — on every tick on every in-scope CPU, just to
+  produce a bool that is immediately discarded.
+- "Consistency with sibling callbacks" is the wrong framing: the
+  sibling callbacks gate because they do work; copying the gate into
+  a body that does nothing imports the cost without the reason.
+
+Spec deviation: `work/task.md` step 2 explicitly required the gate.
+Per the task's MUST-NOT clause ("If any of the above appears
+necessary..., stop and document why in `work/notes.md` before
+proceeding further"), this note is the documentation. The deviation
+is purely a cost-correctness tightening; it does not change the
+hook's observable behavior (still inert), does not touch the trace
+format, and does not affect the kernel ABI we are matching.
+
+The replacement is `(void)p;` to silence the unused-parameter warning
+that would otherwise appear when the compiler sees an unreferenced
+`struct task_struct *p`. The comment above the function now tells the
+next maintainer the right thing: when you add real work, gate on
+`is_target_task(p)` like the other callbacks. That's a one-line
+addition for them, with the rationale already in their face.
+
+Cost change in spawn mode: ~36k tick events/sec system-wide on a
+144-CPU box at HZ=250; each formerly cost 3 kfunc calls, now costs
+0. Not measurable in either direction, but the reviewer's
+"cargo-culted cost" framing is correct on principle. Ship the
+cheaper version.

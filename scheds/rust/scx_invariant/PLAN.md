@@ -241,7 +241,7 @@ struct scx_invariant_event {
 | EVT_STOPPING | 2 | 88 B | Task stopped executing | Done |
 | EVT_RUNNABLE | 3 | 40 B | Task became runnable (woke up) | Done |
 | EVT_QUIESCENT | 4 | 32 B | Task went to sleep | Done |
-| EVT_TICK | 5 | 64 B | Periodic PMU snapshot during long quantum | Pending |
+| EVT_TICK | 5 | 64 B | Reserved in format; not emitted (see Task 7) | Reserved |
 
 Flags (`scx_invariant_event.flags`):
 - `FLAG_MIGRATED` (1<<0) — task is on a different CPU than last run
@@ -283,8 +283,9 @@ Each task moves through these states. Each transition is an event we record.
 ```
 
 All four state-transition events (`EVT_RUNNING`, `EVT_STOPPING`, `EVT_RUNNABLE`,
-`EVT_QUIESCENT`) are now recorded. `EVT_TICK` for periodic PMU snapshots during
-long quanta is the remaining optional addition (Task 7).
+`EVT_QUIESCENT`) are now recorded. Task 7 reserves a minimal `ops.tick()` hook
+in BPF but intentionally does not emit any event; `EVT_TICK` stays reserved in
+the format definition for a future, separately-specified design.
 
 ---
 
@@ -328,13 +329,14 @@ Both `cgroup.rs` (Task 3) and `pmu.rs` (Task 5) now exist in tree:
 | 4a | Sleep durations | runnable + quiescent callbacks; EVT_RUNNABLE/EVT_QUIESCENT | Done |
 | 4b | Wakeup attribution | select_cpu callback; waker fields in EVT_RUNNING | Done |
 | 5 | PMU integration | perf_event_open per CPU; PMU reads in running/stopping; also populate `cpu_perf` from `scx_bpf_cpuperf_cur()` | Done |
-| 7 | Tick recording | ops.tick() callback; periodic PMU snapshots | Pending |
+| 7 | Minimal `ops.tick()` hook | Reserved hook only; no PMU reads, no events, no format change | Done |
 
 **Recommended next order** for the remaining work:
 
-1. **Task 7 — Tick recording**. Periodic PMU snapshots for long-running
-   quanta. Optional; benefits CPU-bound workloads that rarely hit
-   running/stopping.
+1. *(none)* — all roadmap tasks have landed. Future work on `tick()`
+   semantics (what, if anything, is worth recording at a tick boundary)
+   is deferred to a separately-specified task. The PMU truth path stays
+   in `running` / `stopping` (Task 5) until that design exists.
 
 Task 3 (cgroup filtering) landed in two passes: BPF-side gating with rodata
 `cgroup_filtering` / `target_cgid` and `is_target_task(p)` was committed
