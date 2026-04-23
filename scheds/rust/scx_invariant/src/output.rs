@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use log::info;
@@ -13,6 +12,28 @@ const MAGIC: &[u8; 4] = b"SCXI";
 /// unsupported by the in-tree reader.
 const VERSION: u16 = 2;
 const ARCH_AARCH64: u16 = 1;
+
+/// Read CLOCK_MONOTONIC nanoseconds.
+///
+/// The header's `timestamp_start_ns` / `timestamp_end_ns` MUST share a
+/// time domain with the BPF events written to the same trace; the
+/// events use `scx_bpf_now()` which is `bpf_ktime_get_ns()` =
+/// CLOCK_MONOTONIC. Using `SystemTime::now()` (CLOCK_REALTIME) here —
+/// as this code did pre-fix — silently produced traces where every
+/// event's `timestamp_ns - hdr.ts_start` underflowed wildly into the
+/// negative, breaking any consumer that relativized event times to
+/// trace start (heatmap, timeline). The byte layout is unchanged;
+/// only the interpretation of the two timestamp slots shifts.
+///
+/// CLOCK_MONOTONIC is mandatory POSIX and cannot fail with EINVAL on
+/// any supported Linux kernel; treating a non-zero return as
+/// recorder-startup-can't-continue is correct.
+fn monotonic_now_ns() -> u64 {
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    assert!(rc == 0, "clock_gettime(CLOCK_MONOTONIC) failed");
+    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+}
 
 const SECTION_TOPOLOGY: u16 = 0x0001;
 const SECTION_PROCS: u16 = 0x0002;
@@ -47,10 +68,7 @@ impl TraceWriter {
         let mut writer = BufWriter::with_capacity(256 * 1024, file);
 
         // --- File header (64 bytes) ---
-        let now_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+        let now_ns = monotonic_now_ns();
 
         let mut hostname = [0u8; 28];
         if let Ok(name) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
@@ -184,10 +202,7 @@ impl TraceWriter {
         self.writer.flush()?;
 
         // --- Update timestamp_end at offset 20 ---
-        let now_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+        let now_ns = monotonic_now_ns();
         self.writer.seek(SeekFrom::Start(20))?;
         self.writer.write_all(&now_ns.to_le_bytes())?;
         self.writer.flush()?;
