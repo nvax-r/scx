@@ -66,7 +66,6 @@ detection, scheduler diffs) waits until the next phase.
 │  ops.runnable   → emit EVT_RUNNABLE                                  │
 │  ops.quiescent  → emit EVT_QUIESCENT                                 │
 │  ops.select_cpu → capture waker into wakees task_ctx                 │
-│  ops.tick       → (planned) emit EVT_TICK with PMU snapshot          │
 └──────────────────────────────────────────────────────────────────────┘
                               │
                               │ raw event bytes
@@ -245,7 +244,6 @@ struct scx_invariant_event {
 | EVT_STOPPING | 0x0101 | 88 B | Task stopped executing | Done |
 | EVT_RUNNABLE | 0x0102 | 40 B | Task became runnable (woke up) | Done |
 | EVT_QUIESCENT | 0x0103 | 32 B | Task went to sleep | Done |
-| EVT_TICK | 0x0104 | 64 B | Reserved in format; not emitted (see Task 7) | Reserved |
 
 Flags (`scx_invariant_event.flags`):
 - `FLAG_MIGRATED` (1<<0) — task is on a different CPU than last run
@@ -272,7 +270,7 @@ Each task moves through these states. Each transition is an event we record.
        EVT_RUNNING   ←──┤
                         ▼
                   ┌─────────────┐
-                  │   Running   │ ←── EVT_TICK (periodic, optional)
+                  │   Running   │
                   └─────────────┘
                         │ preempted or yielded
        EVT_STOPPING  ←──┤
@@ -287,9 +285,13 @@ Each task moves through these states. Each transition is an event we record.
 ```
 
 All four state-transition events (`EVT_RUNNING`, `EVT_STOPPING`, `EVT_RUNNABLE`,
-`EVT_QUIESCENT`) are now recorded. Task 7 reserves a minimal `ops.tick()` hook
-in BPF but intentionally does not emit any event; `EVT_TICK` stays reserved in
-the format definition for a future, separately-specified design.
+`EVT_QUIESCENT`) are recorded. The scheduler exposes no `ops.tick()` hook and
+the format defines no tick event: a tick boundary is not a state transition,
+so it does not belong in this state machine. If a future design needs to
+record at tick boundaries, it must arrive with its own spec (what is
+recorded, why `running` / `stopping` does not already cover it, and an ABI /
+format-evolution plan) and claim a fresh event ID — do not silently revive
+the old `0x0104` slot.
 
 ---
 
@@ -333,14 +335,14 @@ Both `cgroup.rs` (Task 3) and `pmu.rs` (Task 5) now exist in tree:
 | 4a | Sleep durations | runnable + quiescent callbacks; EVT_RUNNABLE/EVT_QUIESCENT | Done |
 | 4b | Wakeup attribution | select_cpu callback; waker fields in EVT_RUNNING | Done |
 | 5 | PMU integration | perf_event_open per CPU; PMU reads in running/stopping; also populate `cpu_perf` from `scx_bpf_cpuperf_cur()` | Done |
-| 7 | Minimal `ops.tick()` hook | Reserved hook only; no PMU reads, no events, no format change | Done |
 
 **Recommended next order** for the remaining work:
 
-1. *(none)* — all roadmap tasks have landed. Future work on `tick()`
-   semantics (what, if anything, is worth recording at a tick boundary)
-   is deferred to a separately-specified task. The PMU truth path stays
-   in `running` / `stopping` (Task 5) until that design exists.
+1. *(none)* — all roadmap tasks have landed. The PMU truth path lives
+   exclusively in `running` / `stopping` (Task 5). There is no `ops.tick()`
+   hook in tree; if a future design wants tick-boundary recording, it must
+   arrive with its own spec and claim a fresh event ID (do not reuse the
+   old `0x0104` slot).
 
 Task 3 (cgroup filtering) landed in two passes: BPF-side gating with rodata
 `cgroup_filtering` / `target_cgid` and `is_target_task(p)` was committed
@@ -455,8 +457,8 @@ compilation cycle when adding new analysis.
 Each event has `[type: u16][len: u16]` prefix before its payload. **Within a
 major file version** this makes the format forward-compatible: a v2 reader
 can skip event types it does not understand by jumping `len` bytes forward,
-so a producer that adds a new event type (say `EVT_TICK` payload at
-`0x0104`) does not break older v2 readers.
+so a producer that adds a new event type at the next free ID (`0x0104`) does
+not break older v2 readers.
 
 The major version field in the file header (`output.rs::VERSION`) is the
 escape hatch for changes that TLV cannot absorb — header layout, section

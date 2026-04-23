@@ -23,7 +23,6 @@ enum scx_invariant_event_type {
     EVT_STOPPING    = 0x0101,
     EVT_RUNNABLE    = 0x0102,
     EVT_QUIESCENT   = 0x0103,
-    EVT_TICK        = 0x0104,
 };
 
 #define FLAG_MIGRATED       (1 << 0)
@@ -87,16 +86,6 @@ struct evt_runnable {
 struct evt_quiescent {
     struct scx_invariant_event hdr;
     u32 deq_flags;
-    u32 pad;
-};
-
-struct evt_tick {
-    struct scx_invariant_event hdr;
-    u64 pmc_instructions;
-    u64 pmc_cycles;
-    u64 pmc_l2_misses;
-    u64 sum_exec_runtime;
-    u32 nr_running;
     u32 pad;
 };
 

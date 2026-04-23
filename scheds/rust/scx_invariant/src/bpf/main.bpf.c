@@ -371,18 +371,6 @@ void BPF_STRUCT_OPS(invariant_running, struct task_struct *p)
 	tctx->waker_wake_flags = 0;
 }
 
-/*
- * No-op for now. Reserved hook — we'll add work here once we figure out
- * what's actually worth recording at a tick boundary. When real work is
- * added, gate it on is_target_task(p) like the sibling callbacks; an
- * empty body has nothing to short-circuit, so gating here today would
- * just be a kfunc chain in spawn mode for a discarded bool.
- */
-void BPF_STRUCT_OPS(invariant_tick, struct task_struct *p)
-{
-	(void)p;
-}
-
 void BPF_STRUCT_OPS(invariant_stopping, struct task_struct *p, bool runnable)
 {
 	if (!is_target_task(p))
@@ -528,7 +516,6 @@ SCX_OPS_DEFINE(invariant_ops,
 	       .enqueue   = (void *)invariant_enqueue,
 	       .runnable  = (void *)invariant_runnable,
 	       .running   = (void *)invariant_running,
-	       .tick      = (void *)invariant_tick,
 	       .stopping  = (void *)invariant_stopping,
 	       .quiescent = (void *)invariant_quiescent,
 	       .init      = (void *)invariant_init,
