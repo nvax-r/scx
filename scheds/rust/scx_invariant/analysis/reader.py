@@ -25,14 +25,12 @@ EVT_RUNNING   = 0x0100
 EVT_STOPPING  = 0x0101
 EVT_RUNNABLE  = 0x0102
 EVT_QUIESCENT = 0x0103
-EVT_TICK      = 0x0104
 
 EVT_NAMES = {
     EVT_RUNNING:   "RUNNING",
     EVT_STOPPING:  "STOPPING",
     EVT_RUNNABLE:  "RUNNABLE",
     EVT_QUIESCENT: "QUIESCENT",
-    EVT_TICK:      "TICK",
 }
 
 # Exact per-type ABI payload size (full struct including 24-byte header).
@@ -43,7 +41,6 @@ EVT_SIZES = {
     EVT_STOPPING:  88,
     EVT_RUNNABLE:  40,
     EVT_QUIESCENT: 32,
-    EVT_TICK:      64,  # reserved in format; not emitted today (Task 7)
 }
 
 FLAG_MIGRATED    = 1 << 0
