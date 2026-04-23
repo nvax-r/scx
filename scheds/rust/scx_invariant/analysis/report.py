@@ -204,6 +204,39 @@ section h2 {
   padding: 0.05rem 0.3rem;
   border-radius: 2px;
 }
+/* Wakeup graph (§4) — graphviz-rendered, three failure modes, all
+   degrade to a sidecar .dot file + clear message. */
+.wakeups-banner {
+  font-size: 0.85rem;
+  color: #555;
+  margin: 0 0 0.5rem;
+  font-style: italic;
+}
+.wakeups-empty { color: #888; font-style: italic; }
+.wakeups-fallback {
+  color: #b45309;
+  background: #fffbeb;
+  border: 1px solid #fcd34d;
+  padding: 0.5rem 0.75rem;
+  border-radius: 4px;
+}
+.wakeups-fallback code {
+  background: #fef3c7;
+  padding: 0.05rem 0.3rem;
+  border-radius: 2px;
+}
+.wakeups-fallback pre {
+  background: #fef3c7;
+  padding: 0.5rem;
+  border-radius: 2px;
+  overflow-x: auto;
+  font-size: 0.8rem;
+  margin: 0.5rem 0 0;
+}
+.wakeups-svg-wrapper {
+  overflow-x: auto;
+  max-width: 100%;
+}
 footer {
   grid-column: 2;
   padding: 0 2rem 1.5rem;
@@ -906,14 +939,261 @@ def _section_heatmap(hdr: dict, topology: list, events: list) -> str:
     return "".join(parts)
 
 
+# --- §4 Wakeup graph -------------------------------------------------------
+#
+# Directed graph of "thread A woke thread B" edges, weighted by count.
+# Rendered by shelling out to graphviz `dot`. Optional system dep — three
+# failure modes (missing / timeout / dot-error) each degrade to a .dot
+# sidecar file + a clear HTML message; the overall report still exits 0.
+
+# Color hash for nodes — fixed per-PID so the same PID gets the same color
+# across re-renders. Local to report.py for now; if a v2 timeline wants
+# cross-chart consistency it can lift this out.
+_PALETTE = ["#60a5fa", "#fbbf24", "#34d399", "#f472b6",
+            "#a78bfa", "#fb7185", "#facc15", "#22d3ee"]
+
+def _color_for_pid(pid: int) -> str:
+    return _PALETTE[pid % len(_PALETTE)]
+
+
+_WAKEUPS_TOP_N = 100
+_WAKEUPS_DOT_TIMEOUT_S = 30
+
+
+def _collect_wakeup_edges(events: list) -> dict:
+    """Walk events once. Return {(waker_pid, wakee_pid): count}.
+
+    Source: EVT_RUNNING events whose parsed waker_pid is non-zero. The
+    wakee is the event's own pid (the kernel's select_cpu attributed
+    that wakeup). Other event types are ignored.
+    """
+    edges: dict = {}
+    for evt_type, payload in events:
+        if evt_type != trace.EVT_RUNNING:
+            continue
+        parsed = trace.parse_event(evt_type, payload)
+        if not parsed:
+            continue
+        waker = parsed.get("waker_pid", 0)
+        if not waker:
+            continue
+        wakee = parsed["pid"]
+        key = (waker, wakee)
+        edges[key] = edges.get(key, 0) + 1
+    return edges
+
+
+def _dot_escape(s: str) -> str:
+    """Escape a string for inclusion inside a dot quoted-label.
+
+    Defensive against `\\`, `"` and embedded newlines / control chars
+    that the kernel's comm field could in principle carry. Note: callers
+    that want a literal newline in the rendered label use `\\n`
+    (two chars in the source string) which dot interprets — that is
+    NOT escaped here.
+    """
+    return (s.replace("\\", "\\\\")
+             .replace('"', '\\"')
+             .replace("\n", " ")
+             .replace("\r", " ")
+             .replace("\t", " "))
+
+
+def _render_dot_source(edges: dict, procs: dict) -> str:
+    """Build the dot source string for a (capped) edge dict.
+
+    Node and edge styling:
+      - rankdir=LR — waker→wakee reads left-to-right.
+      - bgcolor=transparent — blends with the HTML section background.
+      - per-node color: hash-of-pid via _color_for_pid.
+      - node label: "<pid>\\n<comm>" or just "<pid>" when comm is
+        unknown.
+      - node width: 0.4 + 0.15 * log(total + 1), height auto so the
+        label always fits.
+      - edge label: integer count.
+      - edge penwidth: max(1.0, log(count + 1)).
+      - edge color: single neutral slate (#94a3b8).
+
+    `total` per PID is summed over the edges that survived the top-N
+    cap, so node size matches what the graph actually shows.
+    """
+    import math
+
+    # Aggregate over surviving edges only — keeps node sizes coherent
+    # with the displayed edge set.
+    totals: dict = {}
+    pids: set = set()
+    for (waker, wakee), count in edges.items():
+        pids.add(waker)
+        pids.add(wakee)
+        totals[waker] = totals.get(waker, 0) + count
+        totals[wakee] = totals.get(wakee, 0) + count
+
+    lines = ["digraph wakeups {",
+             "  rankdir=LR;",
+             "  bgcolor=transparent;",
+             '  node [shape=box, style=filled, fontname="monospace", fontsize=11];',
+             '  edge [color="#94a3b8"];']
+
+    # Sorted iteration so the output is deterministic — easier to diff
+    # across runs and easier to test.
+    for pid in sorted(pids):
+        comm = procs.get(pid)
+        if comm:
+            label = f'{pid}\\n{_dot_escape(comm)}'
+        else:
+            label = str(pid)
+        width = 0.4 + 0.15 * math.log(totals.get(pid, 0) + 1)
+        lines.append(
+            f'  n{pid} [label="{label}", '
+            f'fillcolor="{_color_for_pid(pid)}", '
+            f'width={width:.3f}];'
+        )
+
+    for (waker, wakee), count in sorted(edges.items(),
+                                        key=lambda kv: (-kv[1], kv[0])):
+        penwidth = max(1.0, math.log(count + 1))
+        lines.append(
+            f'  n{waker} -> n{wakee} [label="{count}", '
+            f'penwidth={penwidth:.2f}];'
+        )
+
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def _render_via_dot(dot_source: str) -> tuple:
+    """Shell out to `dot -Tsvg`. Returns a tagged-union (status, payload).
+
+    status ∈ {"ok", "err_missing", "err_timeout", "err_dot"}.
+    payload is the SVG string for "ok", an error-detail string (possibly
+    empty) for the err_* variants. Caller composes the HTML message and
+    decides whether to write the .dot sidecar.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["dot", "-Tsvg"],
+            input=dot_source.encode("utf-8"),
+            capture_output=True,
+            timeout=_WAKEUPS_DOT_TIMEOUT_S,
+            check=True,
+        )
+    except FileNotFoundError:
+        return ("err_missing", "")
+    except subprocess.TimeoutExpired:
+        return ("err_timeout", "")
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or b"").decode("utf-8", errors="replace")[:500]
+        return ("err_dot", stderr)
+
+    raw = result.stdout.decode("utf-8", errors="replace")
+    svg_start = raw.find("<svg")
+    if svg_start == -1:
+        return ("err_dot", "dot output missing <svg> root")
+    return ("ok", raw[svg_start:])
+
+
+def _write_dot_sidecar(out_path: str, dot_source: str) -> str:
+    """Write the dot source to <out_path>.wakeups.dot. Returns the path
+    (or an empty string if the write failed, which is logged to stderr
+    but doesn't abort the report)."""
+    sidecar = out_path + ".wakeups.dot"
+    try:
+        Path(sidecar).write_text(dot_source, encoding="utf-8")
+        return sidecar
+    except OSError as e:
+        print(f"report.py: could not write dot sidecar {sidecar}: {e}",
+              file=sys.stderr)
+        return ""
+
+
+def _section_wakeups(hdr: dict, events: list, procs: dict,
+                     out_path: str) -> str:
+    """§4 — wakeup graph rendered via graphviz `dot`. Replaces the stub."""
+    edges = _collect_wakeup_edges(events)
+
+    if not edges:
+        return (
+            '<section id="wakeups">\n'
+            '  <h2>Wakeup graph</h2>\n'
+            '  <p class="wakeups-empty">no waker data recorded — either the '
+            'workload did no wakeups, or select_cpu was not observed for any '
+            'running transition</p>\n'
+            '</section>'
+        )
+
+    total_edges = len(edges)
+    banner_html = ""
+    if total_edges > _WAKEUPS_TOP_N:
+        # Keep the top-N by count, ties broken by lexicographic edge.
+        kept = dict(sorted(edges.items(),
+                           key=lambda kv: (-kv[1], kv[0]))[:_WAKEUPS_TOP_N])
+        banner_html = (
+            f'<p class="wakeups-banner">showing top {_WAKEUPS_TOP_N} of '
+            f'{total_edges} wakeup edges</p>'
+        )
+    else:
+        kept = edges
+
+    dot_source = _render_dot_source(kept, procs)
+    status, payload = _render_via_dot(dot_source)
+
+    if status == "ok":
+        parts = ['<section id="wakeups">\n', '  <h2>Wakeup graph</h2>\n']
+        if banner_html:
+            parts.append(f'  {banner_html}\n')
+        parts.append('  <div class="wakeups-svg-wrapper">\n')
+        parts.append(f'    {payload}\n')
+        parts.append('  </div>\n')
+        parts.append('</section>')
+        return "".join(parts)
+
+    # All err_* paths: write the .dot sidecar, render fallback message.
+    sidecar = _write_dot_sidecar(out_path, dot_source)
+    sidecar_note = ""
+    if sidecar:
+        sidecar_rel = os.path.basename(sidecar)
+        sidecar_note = (f' Source written to <code>{html.escape(sidecar_rel)}'
+                        f'</code>.')
+
+    if status == "err_missing":
+        body = (
+            'graphviz <code>dot</code> not found on PATH — install it '
+            '(e.g. <code>apt install graphviz</code>) to get the '
+            f'rendered graph.{sidecar_note}'
+        )
+    elif status == "err_timeout":
+        body = (
+            f'graphviz <code>dot</code> timed out '
+            f'(&gt;{_WAKEUPS_DOT_TIMEOUT_S}s) — graph probably too large to '
+            f'render.{sidecar_note} Try <code>sfdp -Tsvg</code> or reduce '
+            f'the top-edges cap.'
+        )
+    else:  # err_dot
+        body = (
+            f'graphviz <code>dot</code> failed.{sidecar_note}'
+            f'<pre>{html.escape(payload)}</pre>'
+        )
+
+    parts = ['<section id="wakeups">\n', '  <h2>Wakeup graph</h2>\n']
+    if banner_html:
+        parts.append(f'  {banner_html}\n')
+    parts.append(f'  <p class="wakeups-fallback">{body}</p>\n')
+    parts.append('</section>')
+    return "".join(parts)
+
+
 def _render(trace_path: str, hdr: dict, topology: list,
-            events: list, procs: dict) -> str:
+            events: list, procs: dict, out_path: str) -> str:
     sections = [_section_overview(trace_path, hdr, events, procs)]
     for sid, title in _TOC_ENTRIES[1:]:
         if sid == "timeline":
             sections.append(_section_timeline(hdr, events, procs))
         elif sid == "heatmap":
             sections.append(_section_heatmap(hdr, topology, events))
+        elif sid == "wakeups":
+            sections.append(_section_wakeups(hdr, events, procs, out_path))
         else:
             sections.append(_section_stub(sid, title))
 
@@ -976,7 +1256,7 @@ def main() -> int:
         data = Path(args.trace).read_bytes()
         hdr = trace.read_header(data)
         topology, events, procs = trace.read_sections(data, hdr["header_size"])
-        rendered = _render(args.trace, hdr, topology, events, procs)
+        rendered = _render(args.trace, hdr, topology, events, procs, out)
     except trace.UnsupportedVersionError as e:
         print(f"report.py: {e}", file=sys.stderr)
         return 1
