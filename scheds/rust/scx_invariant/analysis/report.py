@@ -184,6 +184,26 @@ section h2 {
   padding: 0.05rem 0.3rem;
   border-radius: 2px;
 }
+/* Heatmap (§2) — same fallback / empty-state idiom as the timeline. */
+.heatmap-note {
+  font-size: 0.85rem;
+  color: #555;
+  margin: 0 0 0.5rem;
+  font-style: italic;
+}
+.heatmap-empty { color: #888; font-style: italic; }
+.heatmap-fallback {
+  color: #b45309;
+  background: #fffbeb;
+  border: 1px solid #fcd34d;
+  padding: 0.5rem 0.75rem;
+  border-radius: 4px;
+}
+.heatmap-fallback code {
+  background: #fef3c7;
+  padding: 0.05rem 0.3rem;
+  border-radius: 2px;
+}
 footer {
   grid-column: 2;
   padding: 0 2rem 1.5rem;
@@ -618,12 +638,282 @@ def _section_timeline(hdr: dict, events: list, procs: dict) -> str:
     return "".join(parts)
 
 
+# --- §2 CPU heatmap --------------------------------------------------------
+#
+# Per-CPU busy fraction over time. Driven exclusively by EVT_STOPPING events
+# (their runtime_ns is the truth source). Rows are NUMA/LLC/cpu_id-sorted so
+# imbalance reads at a glance, with thin separator lines between NUMA blocks.
+
+# n_buckets is min(500, max(1, duration_ns // 1ms)). At 5s → 500 buckets
+# (~10ms each); at 100ms → 100 buckets (~1ms each).
+_HEATMAP_MAX_BUCKETS = 500
+
+
+def _cpu_render_order(topology: list, nr_cpus: int) -> tuple:
+    """Return (cpu_order, numa_breaks) for the heatmap's row layout.
+
+    cpu_order: list of cpu_ids in render order (top → bottom).
+    numa_breaks: list of row indices where a NUMA block transition starts;
+                 the renderer draws a thin separator above each.
+
+    Defensive fallbacks:
+      - empty topology  → natural [0, nr_cpus) order, no separators.
+      - cpu_ids in [0, nr_cpus) missing from topology → appended at end
+        (synthetic numa/llc = -1) so the heatmap row count always matches
+        nr_cpus.
+    """
+    if not topology:
+        return list(range(nr_cpus)), []
+
+    by_cpu = {t["cpu_id"]: t for t in topology}
+    seen = set(by_cpu.keys())
+    sorted_known = sorted(
+        topology, key=lambda t: (t["numa_id"], t["llc_id"], t["cpu_id"])
+    )
+    cpu_order = [t["cpu_id"] for t in sorted_known]
+    # Append any CPU id in [0, nr_cpus) that the topology section omitted.
+    for c in range(nr_cpus):
+        if c not in seen:
+            cpu_order.append(c)
+
+    numa_breaks: list = []
+    prev_numa = None
+    for i, c in enumerate(cpu_order):
+        cur_numa = by_cpu.get(c, {}).get("numa_id")
+        if i > 0 and cur_numa != prev_numa:
+            numa_breaks.append(i)
+        prev_numa = cur_numa
+    return cpu_order, numa_breaks
+
+
+def _add_to_buckets(matrix_row: list, t_start: float, t_stop: float,
+                    bucket_width: float, n_buckets: int) -> None:
+    """Distribute one running interval into bucket fractions (in place).
+
+    Both timestamps are trace-relative ns. `t_start` and `t_stop` are
+    clipped to [0, n_buckets * bucket_width] so events past the trace
+    window can't index OOB. Half-open right edge — an interval ending
+    exactly on a bucket boundary belongs to the previous bucket.
+    """
+    span_end_ns = n_buckets * bucket_width
+    if t_start < 0:
+        t_start = 0
+    if t_stop > span_end_ns:
+        t_stop = span_end_ns
+    if t_stop <= t_start:
+        return
+
+    first_b = int(t_start // bucket_width)
+    # Half-open: subtract a tiny epsilon so a stop on the boundary lands
+    # in the previous bucket. Bounded by n_buckets - 1 in case of float
+    # rounding pushing us past the last index.
+    last_b = min(n_buckets - 1, int((t_stop - 1e-9) // bucket_width))
+
+    if first_b == last_b:
+        matrix_row[first_b] += (t_stop - t_start) / bucket_width
+        return
+
+    matrix_row[first_b] += ((first_b + 1) * bucket_width - t_start) / bucket_width
+    for b in range(first_b + 1, last_b):
+        matrix_row[b] += 1.0
+    matrix_row[last_b] += (t_stop - last_b * bucket_width) / bucket_width
+
+
+def _build_busy_matrix(nr_cpus: int, events: list, ts_start: int,
+                       duration_ns: int, n_buckets: int,
+                       cpu_to_row: dict) -> tuple:
+    """Build the (nr_cpus × n_buckets) busy-fraction matrix.
+
+    cpu_to_row maps a raw cpu_id (from the event's `cpu` field) to the
+    matrix row index, so callers can keep the matrix laid out in
+    NUMA/LLC/cpu_id render order without a second permutation pass.
+
+    Returns (matrix, max_pre_clamp_value) so the caller can decide whether
+    to emit the "overlapping quanta" stderr warning.
+    """
+    bucket_width = duration_ns / n_buckets if n_buckets else 1.0
+    matrix = [[0.0] * n_buckets for _ in range(nr_cpus)]
+
+    n_stopping = 0
+    for evt_type, payload in events:
+        if evt_type != trace.EVT_STOPPING:
+            continue
+        parsed = trace.parse_event(evt_type, payload)
+        if not parsed:
+            continue
+        n_stopping += 1
+        cpu_id = parsed["cpu"]
+        row = cpu_to_row.get(cpu_id)
+        if row is None or row >= nr_cpus:
+            continue  # event references a cpu not in our render set
+        runtime_ns = parsed.get("runtime_ns", 0)
+        if runtime_ns <= 0:
+            continue
+        t_stop = parsed["timestamp_ns"] - ts_start
+        t_start = t_stop - runtime_ns
+        _add_to_buckets(matrix[row], t_start, t_stop, bucket_width, n_buckets)
+
+    # Clamp; capture the worst overshoot for the stderr warning.
+    max_seen = 0.0
+    for row in matrix:
+        for b in range(n_buckets):
+            if row[b] > max_seen:
+                max_seen = row[b]
+            if row[b] > 1.0:
+                row[b] = 1.0
+    return matrix, max_seen, n_stopping
+
+
+def _build_heatmap_svg(matrix: list, cpu_order: list, numa_breaks: list,
+                       duration_ns: int) -> str:
+    """Render the busy-fraction matrix into an inlined <svg>.
+
+    Lazy-imports matplotlib (raises ImportError if unavailable so the
+    caller's fail-soft path can short-circuit). Strips the XML/DOCTYPE
+    prolog for inlining inside HTML5 <body>.
+    """
+    import io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    nr_cpus = len(cpu_order)
+    fig_h = min(20.0, max(4.0, nr_cpus * 0.1))
+    fig_w = 16.0
+    duration_s = duration_ns / 1e9 if duration_ns > 0 else 1.0
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+
+    # extent puts seconds on X for free (no tick remapping).
+    im = ax.imshow(
+        matrix,
+        aspect="auto",
+        interpolation="nearest",
+        cmap="viridis",
+        vmin=0.0,
+        vmax=1.0,
+        extent=(0.0, duration_s, nr_cpus, 0.0),
+    )
+
+    # Y labels: every 16 rows for nr_cpus ≥ 32, every 8 below; always
+    # include first and last. Label values are the actual cpu_id at that
+    # row (cpu_order may be NUMA-shuffled, so row index ≠ cpu_id).
+    step = 16 if nr_cpus >= 32 else 8
+    rows_to_label = list(range(0, nr_cpus, step))
+    if (nr_cpus - 1) not in rows_to_label:
+        rows_to_label.append(nr_cpus - 1)
+    ax.set_yticks([r + 0.5 for r in rows_to_label])
+    ax.set_yticklabels([str(cpu_order[r]) for r in rows_to_label],
+                       fontsize=7)
+    ax.set_ylabel("CPU id")
+    ax.set_xlabel("Time since trace start (s)")
+    ax.tick_params(axis="x", labelsize=8)
+
+    # NUMA separators: thin semi-transparent lines between blocks.
+    for row in numa_breaks:
+        ax.axhline(y=row, color="white", linewidth=0.6, alpha=0.55)
+
+    # Narrow colorbar on the right.
+    cbar = fig.colorbar(im, ax=ax, fraction=0.012, pad=0.01)
+    cbar.set_label("fraction busy", fontsize=8)
+    cbar.ax.tick_params(labelsize=7)
+
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="svg", bbox_inches="tight")
+    plt.close(fig)
+    raw = buf.getvalue().decode("utf-8")
+    svg_start = raw.find("<svg")
+    if svg_start == -1:
+        raise RuntimeError("matplotlib SVG output missing <svg> root")
+    return raw[svg_start:]
+
+
+def _section_heatmap(hdr: dict, topology: list, events: list) -> str:
+    """§2 — per-CPU busy-fraction heatmap. Replaces the Task-2 stub."""
+    nr_cpus = hdr.get("nr_cpus", 0) or 0
+    if nr_cpus <= 0:
+        return (
+            '<section id="heatmap">\n'
+            '  <h2>CPU heatmap</h2>\n'
+            '  <p class="heatmap-empty">no CPU topology recorded</p>\n'
+            '</section>'
+        )
+
+    # Defensive trace_end widening, same shape as Task 3.
+    ts_start = hdr.get("ts_start", 0) or 0
+    nominal = (hdr["ts_end"] - ts_start) if hdr.get("ts_end", 0) else 0
+    max_ev_ts = 0
+    for evt_type, payload in events:
+        parsed = trace.parse_event(evt_type, payload)
+        if parsed and parsed["timestamp_ns"] > max_ev_ts:
+            max_ev_ts = parsed["timestamp_ns"]
+    duration_ns = max(nominal, max_ev_ts - ts_start, 0)
+    if duration_ns <= 0:
+        return (
+            '<section id="heatmap">\n'
+            '  <h2>CPU heatmap</h2>\n'
+            '  <p class="heatmap-empty">trace has zero duration</p>\n'
+            '</section>'
+        )
+
+    n_buckets = min(_HEATMAP_MAX_BUCKETS,
+                    max(1, duration_ns // 1_000_000))
+
+    cpu_order, numa_breaks = _cpu_render_order(topology, nr_cpus)
+    cpu_to_row = {cpu: i for i, cpu in enumerate(cpu_order)}
+
+    matrix, max_seen, n_stopping = _build_busy_matrix(
+        nr_cpus, events, ts_start, duration_ns, n_buckets, cpu_to_row,
+    )
+
+    # Spec: ε-overshoot is silent; anything farther means physically
+    # overlapping quanta on one CPU (shouldn't happen). One-line stderr
+    # warning, no spam.
+    if max_seen > 1.0 + 1e-6:
+        print(
+            f"report.py: heatmap cell sum exceeded 1.0 (max={max_seen:.4f}); "
+            f"clamped — possible overlapping quanta on one CPU",
+            file=sys.stderr,
+        )
+
+    note_html = ""
+    if n_stopping == 0:
+        note_html = ('<p class="heatmap-note">'
+                     'no stopping events — all CPUs idle for the recorded window'
+                     '</p>')
+
+    try:
+        svg = _build_heatmap_svg(matrix, cpu_order, numa_breaks, duration_ns)
+    except ImportError:
+        return (
+            '<section id="heatmap">\n'
+            '  <h2>CPU heatmap</h2>\n'
+            '  <p class="heatmap-fallback">matplotlib not installed — '
+            '<code>pip install -r analysis/requirements.txt</code></p>\n'
+            '</section>'
+        )
+
+    parts = ['<section id="heatmap">\n', '  <h2>CPU heatmap</h2>\n']
+    if note_html:
+        parts.append(f'  {note_html}\n')
+    parts.append(f'  {svg}\n')
+    parts.append('</section>')
+    return "".join(parts)
+
+
 def _render(trace_path: str, hdr: dict, topology: list,
             events: list, procs: dict) -> str:
     sections = [_section_overview(trace_path, hdr, events, procs)]
     for sid, title in _TOC_ENTRIES[1:]:
         if sid == "timeline":
             sections.append(_section_timeline(hdr, events, procs))
+        elif sid == "heatmap":
+            sections.append(_section_heatmap(hdr, topology, events))
         else:
             sections.append(_section_stub(sid, title))
 
