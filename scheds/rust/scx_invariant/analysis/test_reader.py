@@ -26,7 +26,8 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import reader  # noqa: E402
+import trace  # noqa: E402
+import reader  # noqa: E402, F401  # import-only smoke test that reader.py still loads
 
 
 # Field widths the synthesizer needs to know about. Kept local on
@@ -59,7 +60,7 @@ def _section_topology(nr_cpus: int = 1) -> bytes:
     for cpu in range(nr_cpus):
         # cpu_id, llc_id, numa_id, max_freq_mhz, capacity, _pad
         payload += struct.pack("<HHHHIi", cpu, 0, 0, 2400, 1024, 0)
-    sec_hdr = struct.pack("<HI", reader.SECTION_TOPOLOGY, len(payload))
+    sec_hdr = struct.pack("<HI", trace.SECTION_TOPOLOGY, len(payload))
     return sec_hdr + bytes(payload)
 
 
@@ -68,10 +69,10 @@ def _evt_runnable(pid: int, tgid: int, cpu: int, ts: int) -> bytes:
     full = bytearray(40)
     # common header @ 0..24
     struct.pack_into("<QIII HH", full, 0,
-                     ts, pid, tgid, cpu, reader.EVT_RUNNABLE, 0)
+                     ts, pid, tgid, cpu, trace.EVT_RUNNABLE, 0)
     # payload @ 24..40: sleep_duration_ns(u64), enq_flags(u32), pad(u32)
     struct.pack_into("<QII", full, 24, 1_500_000, 0, 0)
-    tlv = struct.pack("<HH", reader.EVT_RUNNABLE, len(full)) + bytes(full)
+    tlv = struct.pack("<HH", trace.EVT_RUNNABLE, len(full)) + bytes(full)
     return tlv
 
 
@@ -79,7 +80,7 @@ def _section_events(events: bytes) -> bytes:
     # SECTION_EVENTS uses sec_len=0 in the producer (see output.rs); the
     # reader walks TLVs until it hits a non-event type or EOF. Mirror
     # that here so the test exercises the production code path.
-    sec_hdr = struct.pack("<HI", reader.SECTION_EVENTS, 0)
+    sec_hdr = struct.pack("<HI", trace.SECTION_EVENTS, 0)
     return sec_hdr + events
 
 
@@ -89,7 +90,7 @@ def _section_procs(entries: list[tuple[int, str]]) -> bytes:
     for pid, comm in entries:
         comm_b = comm.encode("utf-8")[:16].ljust(16, b"\x00")
         payload += struct.pack("<I", pid) + comm_b
-    sec_hdr = struct.pack("<HI", reader.SECTION_PROCS, len(payload))
+    sec_hdr = struct.pack("<HI", trace.SECTION_PROCS, len(payload))
     return sec_hdr + bytes(payload)
 
 
@@ -119,10 +120,10 @@ class TestV2TwoPidTrace(unittest.TestCase):
         path = _write_temp_trace(blob)
         try:
             data = Path(path).read_bytes()
-            hdr = reader.read_header(data)
+            hdr = trace.read_header(data)
             self.assertEqual(hdr["version"], 2)
 
-            topology, events, procs = reader.read_sections(data, hdr["header_size"])
+            topology, events, procs = trace.read_sections(data, hdr["header_size"])
 
             # Process table parses to exactly two entries.
             self.assertEqual(len(procs), 2, f"expected 2 procs, got {procs!r}")
@@ -133,7 +134,7 @@ class TestV2TwoPidTrace(unittest.TestCase):
             # section being misread as an EVT_RUNNABLE.
             self.assertEqual(len(events), 1, f"phantom event detected: {events!r}")
             evt_type, _payload = events[0]
-            self.assertEqual(evt_type, reader.EVT_RUNNABLE)
+            self.assertEqual(evt_type, trace.EVT_RUNNABLE)
 
             # Topology survived as well.
             self.assertEqual(len(topology), 1)
@@ -151,8 +152,8 @@ class TestV1Rejected(unittest.TestCase):
         path = _write_temp_trace(blob)
         try:
             data = Path(path).read_bytes()
-            with self.assertRaises(reader.UnsupportedVersionError) as cm:
-                reader.read_header(data)
+            with self.assertRaises(trace.UnsupportedVersionError) as cm:
+                trace.read_header(data)
             msg = str(cm.exception)
             self.assertIn("v1", msg)
             self.assertIn("v2", msg)
@@ -167,7 +168,7 @@ class TestV1Rejected(unittest.TestCase):
         try:
             data = Path(path).read_bytes()
             with self.assertRaises(ValueError):
-                reader.read_header(data)
+                trace.read_header(data)
         finally:
             os.unlink(path)
 
