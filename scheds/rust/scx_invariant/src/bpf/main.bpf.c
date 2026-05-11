@@ -1,4 +1,5 @@
 #include <scx/common.bpf.h>
+#include <bpf_experimental.h>
 #include "intf.h"
 #include <lib/cleanup.bpf.h>
 
@@ -65,6 +66,52 @@ struct {
 	__type(key, int);
 	__type(value, struct task_ctx);
 } task_ctx_map SEC(".maps");
+
+/*
+ * Process-only waker attribution filter.
+ *
+ * `current` in ops.select_cpu() is only a candidate waker. select_task_rq_scx
+ * is reached from try_to_wake_up(), which can fire from many non-process
+ * contexts: hardirq/softirq/NMI handlers, the idle task draining deferred
+ * wake work, kworkers, ksoftirqd, IO workers, etc. Recording any of those
+ * as a process waker fabricates fake process-to-process edges in the wakeup
+ * graph. The correct behavior is to emit no waker (waker_pid = 0) when the
+ * candidate is not a normal process running in task context — readers
+ * already treat a zero waker_pid as "no edge".
+ *
+ * This is the scx-only filter: we do not try to recover the original waker
+ * for queued/deferred wakeups (those go through wake-list drains on a
+ * different CPU and lose process causality entirely). Such wakeups are left
+ * as unknown rather than attributed to whatever happens to be drain-side
+ * `current`.
+ *
+ * The IRQ/softirq/NMI helpers are reliable on x86 and arm64 only, which
+ * covers our target machines and matches scx_lavd's usage pattern.
+ */
+static __always_inline void clear_waker(struct task_ctx *tctx)
+{
+	tctx->waker_pid = 0;
+	tctx->waker_tgid = 0;
+	tctx->waker_flags = 0;
+	tctx->waker_wake_flags = 0;
+}
+
+static __always_inline bool is_process_waker(struct task_struct *waker)
+{
+	if (!waker)
+		return false;
+
+	if (bpf_in_hardirq() || bpf_in_serving_softirq() || bpf_in_nmi())
+		return false;
+
+	if (waker->pid == 0 || waker->tgid == 0)
+		return false;
+
+	if (waker->flags & (PF_IDLE | PF_KTHREAD | PF_WQ_WORKER | PF_IO_WORKER))
+		return false;
+
+	return true;
+}
 
 /* 6 partitioned ring buffers (32MB each) */
 struct {
@@ -254,6 +301,11 @@ s32 BPF_STRUCT_OPS(invariant_select_cpu, struct task_struct *p, s32 prev_cpu,
 		return prev_cpu;
 
 	struct task_struct *waker = bpf_get_current_task_btf();
+	if (!is_process_waker(waker)) {
+		clear_waker(tctx);
+		return prev_cpu;
+	}
+
 	tctx->waker_pid = waker->pid;
 	tctx->waker_tgid = waker->tgid;
 	tctx->waker_wake_flags = wake_flags;
@@ -365,10 +417,7 @@ void BPF_STRUCT_OPS(invariant_running, struct task_struct *p)
 	tctx->pmc_l2_misses_start     = l2m_start;
 	tctx->pmc_stall_backend_start = stall_start;
 	/* Clear waker fields to avoid stale data on next schedule */
-	tctx->waker_pid = 0;
-	tctx->waker_tgid = 0;
-	tctx->waker_flags = 0;
-	tctx->waker_wake_flags = 0;
+	clear_waker(tctx);
 }
 
 void BPF_STRUCT_OPS(invariant_stopping, struct task_struct *p, bool runnable)
