@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 
@@ -50,14 +51,40 @@ pub struct CpuTopo {
     pub _pad: u32,
 }
 
+/// Read /proc/<pid>/comm into a fixed 16-byte slot, NUL-padded.
+///
+/// Returns an all-zero array when the read fails (process already gone,
+/// permission denied, etc). The 15-byte cap leaves room for a trailing
+/// NUL inside the 16-byte on-disk slot, which matches the reader's
+/// convention of treating the first NUL as the comm terminator.
+fn read_proc_comm(pid: u32) -> [u8; 16] {
+    let mut comm = [0u8; 16];
+    let path = format!("/proc/{}/comm", pid);
+    if let Ok(name) = std::fs::read_to_string(&path) {
+        let name = name.trim();
+        let len = name.len().min(15);
+        comm[..len].copy_from_slice(&name.as_bytes()[..len]);
+    }
+    comm
+}
+
 /// Fast binary trace writer.
 ///
 /// Hot path: `write_event` receives raw `&[u8]` from the ring buffer and
 /// writes a 4-byte TLV prefix + raw payload.  No struct parsing.
+///
+/// `procs_seen` doubles as the unique-PID set and the per-PID `comm`
+/// snapshot. Comm is captured the first time a PID is observed in
+/// `write_event` rather than at `finalize`, because /proc/<pid>/comm
+/// disappears as soon as the process exits — and short-lived workloads
+/// (build steps, shell pipelines) routinely outlive the trace writer's
+/// poll loop. First-sight capture turns "all-empty comms for short-lived
+/// PIDs" (the prior behavior) into "comms recorded for every PID we
+/// actually saw an event from while it was alive".
 pub struct TraceWriter {
     writer: BufWriter<File>,
     event_count: u64,
-    pids_seen: HashSet<u32>,
+    procs_seen: HashMap<u32, [u8; 16]>,
 }
 
 impl TraceWriter {
@@ -135,7 +162,7 @@ impl TraceWriter {
         Ok(Self {
             writer,
             event_count: 0,
-            pids_seen: HashSet::with_capacity(4096),
+            procs_seen: HashMap::with_capacity(4096),
         })
     }
 
@@ -158,7 +185,12 @@ impl TraceWriter {
 
         // Read pid from offset 8 (u32 LE)
         let pid = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-        self.pids_seen.insert(pid);
+        // First-sight comm capture. Entry API does a single hash lookup
+        // — same hot-path cost as the prior HashSet::insert. On a repeat
+        // PID we land in `Occupied` and skip the /proc read entirely.
+        if let Entry::Vacant(slot) = self.procs_seen.entry(pid) {
+            slot.insert(read_proc_comm(pid));
+        }
 
         // Write TLV prefix
         self.writer.write_all(&event_type.to_le_bytes())?;
@@ -171,23 +203,33 @@ impl TraceWriter {
     }
 
     /// Finalize the trace: write process table, update timestamp_end.
+    ///
+    /// The process table is materialized from the first-sight comm
+    /// snapshots already in `procs_seen` — no /proc reads happen here.
+    /// PIDs whose first-sight read failed (process already a zombie or
+    /// the read raced with /proc/<pid> teardown) get a re-read attempt
+    /// from /proc as a best-effort recovery; if that also fails the
+    /// entry stays in the table with an empty comm so the section size
+    /// math (20 B per entry) is unchanged from prior traces.
     pub fn finalize(&mut self) -> Result<u64> {
         // Flush any buffered event data first
         self.writer.flush()?;
 
         // --- Process table section ---
-        // Collect process names for all PIDs we saw
-        let mut proc_entries: Vec<(u32, [u8; 16])> = Vec::new();
-        for &pid in &self.pids_seen {
-            let path = format!("/proc/{}/comm", pid);
-            let mut comm = [0u8; 16];
-            if let Ok(name) = std::fs::read_to_string(&path) {
-                let name = name.trim();
-                let len = name.len().min(15);
-                comm[..len].copy_from_slice(&name.as_bytes()[..len]);
+        // Pull the first-sight snapshots into a stable order (sorted by
+        // pid) so binary diffs across runs of the same workload stay
+        // small and reader output is deterministic.
+        let mut proc_entries: Vec<(u32, [u8; 16])> =
+            self.procs_seen.iter().map(|(&pid, &comm)| (pid, comm)).collect();
+        proc_entries.sort_by_key(|(pid, _)| *pid);
+
+        // Best-effort recovery for PIDs whose first-sight read failed.
+        // Almost always still empty — by definition the process was
+        // unreadable when alive — but cheap to retry.
+        for (pid, comm) in proc_entries.iter_mut() {
+            if comm[0] == 0 {
+                *comm = read_proc_comm(*pid);
             }
-            // Include the entry even if comm is empty (process exited)
-            proc_entries.push((pid, comm));
         }
 
         // Section header: type(u16) + len(u32)
@@ -210,7 +252,7 @@ impl TraceWriter {
         info!(
             "Trace finalized: {} events, {} unique PIDs, {} procs resolved",
             self.event_count,
-            self.pids_seen.len(),
+            self.procs_seen.len(),
             proc_entries.iter().filter(|(_, c)| c[0] != 0).count()
         );
 
