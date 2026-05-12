@@ -183,6 +183,39 @@ static __always_inline void rb_drop_inc(void)
 		__sync_fetch_and_add(cnt, 1);
 }
 
+/*
+ * Common 24-byte header initializer. Spec calls it out (work/task.md
+ * MUST-do §1) to consolidate the open-coded pattern across all five
+ * existing event-emit sites and the three new ones. Caller may
+ * override hdr->flags afterwards (FLAG_MIGRATED for running,
+ * FLAG_VOLUNTARY for stopping); fill_hdr always sets flags=0.
+ *
+ * Uses bpf_get_smp_processor_id() for the cpu slot rather than
+ * scx_bpf_task_cpu(p) — the two are equal during the existing
+ * struct_ops callbacks (they run on p's CPU) and the SMP variant is
+ * cheaper (no task_struct deref) and well-defined for init_task /
+ * sched_process_exec contexts where p->cpu may not yet be set or
+ * does not refer to the current CPU. Routing into the 6 ring buffers
+ * still uses the local `cpu` variable in each callback, which is
+ * the same value within a single invocation.
+ *
+ * timestamp_ns is sampled here from scx_bpf_now(); callers that
+ * already pre-computed `now` for runtime/wait deltas may see a
+ * sub-microsecond drift between hdr.timestamp_ns and that local
+ * `now`. Acceptable: the on-disk field semantics is "when this
+ * event was emitted", not "when the recorded transition occurred".
+ */
+static __always_inline void fill_hdr(struct scx_invariant_event *hdr,
+				     struct task_struct *p, u16 event_type)
+{
+	hdr->timestamp_ns = scx_bpf_now();
+	hdr->pid = p->pid;
+	hdr->tgid = p->tgid;
+	hdr->cpu = bpf_get_smp_processor_id();
+	hdr->event_type = event_type;
+	hdr->flags = 0;
+}
+
 s32 BPF_STRUCT_OPS(invariant_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
@@ -233,11 +266,7 @@ void BPF_STRUCT_OPS(invariant_running, struct task_struct *p)
 
 	struct evt_running *evt = rb_reserve(cpu, sizeof(*evt));
 	if (evt) {
-		evt->hdr.timestamp_ns = now;
-		evt->hdr.pid = p->pid;
-		evt->hdr.tgid = p->tgid;
-		evt->hdr.cpu = cpu;
-		evt->hdr.event_type = EVT_RUNNING;
+		fill_hdr(&evt->hdr, p, EVT_RUNNING);
 		evt->hdr.flags = migrated ? FLAG_MIGRATED : 0;
 		evt->runq_wait_ns = (p->scx.runnable_at > 0) ?
 				     (now - p->scx.runnable_at) : 0;
@@ -285,11 +314,7 @@ void BPF_STRUCT_OPS(invariant_stopping, struct task_struct *p, bool runnable)
 
 	struct evt_stopping *evt = rb_reserve(cpu, sizeof(*evt));
 	if (evt) {
-		evt->hdr.timestamp_ns = now;
-		evt->hdr.pid = p->pid;
-		evt->hdr.tgid = p->tgid;
-		evt->hdr.cpu = cpu;
-		evt->hdr.event_type = EVT_STOPPING;
+		fill_hdr(&evt->hdr, p, EVT_STOPPING);
 		evt->hdr.flags = runnable ? 0 : FLAG_VOLUNTARY;
 		evt->runtime_ns = runtime;
 		/*
@@ -311,6 +336,48 @@ void BPF_STRUCT_OPS(invariant_stopping, struct task_struct *p, bool runnable)
 	}
 
 	tctx->last_stopping_at = now;
+
+	/*
+	 * Per-quantum user-stack sample.
+	 *
+	 * Cannot use bpf_get_stackid() here — the helper is unavailable
+	 * to sched_ext struct_ops programs (kernel/sched/ext.c sets
+	 * .get_func_proto = bpf_base_func_proto, which does NOT expose
+	 * BPF_FUNC_get_stackid). The four bpf_get_stackid_proto_*
+	 * variants in kernel/bpf/stackmap.c and kernel/trace/bpf_trace.c
+	 * each require a pt_regs / perf-event / tracepoint context that
+	 * struct_ops cannot supply.
+	 *
+	 * Use bpf_get_task_stack() instead — it IS in bpf_base_func_proto
+	 * (kernel/bpf/helpers.c BPF_FUNC_get_task_stack) and accepts a
+	 * BTF-verified task pointer. Stack-id dedup happens userspace-
+	 * side in src/output.rs (Vec<u64> hash → u32 sid). The on-disk
+	 * EVT_SAMPLE record stays at 32 B per the design spec; the wire
+	 * format here is 160 B (carries the inline IP[] for the
+	 * recorder to hash).
+	 *
+	 * BPF_F_FAST_STACK_CMP doesn't apply (it's a flag for the
+	 * stackmap dedup hash inside bpf_get_stackid). Only
+	 * BPF_F_USER_STACK is meaningful for bpf_get_task_stack —
+	 * kernel-side stacks are out of scope for this iteration per
+	 * design §10.
+	 *
+	 * Walk failure (negative bpf_get_task_stack return) is recorded
+	 * as-is in walk_ret; the userspace transformer carries the
+	 * negative value into the on-disk stack_id slot.
+	 */
+	struct evt_sample *sevt = rb_reserve(cpu, sizeof(*sevt));
+	if (sevt) {
+		fill_hdr(&sevt->hdr, p, EVT_SAMPLE);
+		sevt->pad = 0;
+		__builtin_memset(sevt->ip, 0, sizeof(sevt->ip));
+		long ret = bpf_get_task_stack(p, sevt->ip, sizeof(sevt->ip),
+					      BPF_F_USER_STACK);
+		sevt->walk_ret = (s32)ret;
+		rb_submit(sevt);
+	} else {
+		rb_drop_inc();
+	}
 }
 
 void BPF_STRUCT_OPS(invariant_runnable, struct task_struct *p, u64 enq_flags)
@@ -332,12 +399,7 @@ void BPF_STRUCT_OPS(invariant_runnable, struct task_struct *p, u64 enq_flags)
 
 	struct evt_runnable *evt = rb_reserve(cpu, sizeof(*evt));
 	if (evt) {
-		evt->hdr.timestamp_ns = now;
-		evt->hdr.pid = p->pid;
-		evt->hdr.tgid = p->tgid;
-		evt->hdr.cpu = cpu;
-		evt->hdr.event_type = EVT_RUNNABLE;
-		evt->hdr.flags = 0;
+		fill_hdr(&evt->hdr, p, EVT_RUNNABLE);
 		evt->sleep_duration_ns = sleep_duration;
 		evt->enq_flags = (u32)enq_flags;
 		evt->pad = 0;
@@ -363,18 +425,113 @@ void BPF_STRUCT_OPS(invariant_quiescent, struct task_struct *p, u64 deq_flags)
 
 	struct evt_quiescent *evt = rb_reserve(cpu, sizeof(*evt));
 	if (evt) {
-		evt->hdr.timestamp_ns = now;
-		evt->hdr.pid = p->pid;
-		evt->hdr.tgid = p->tgid;
-		evt->hdr.cpu = cpu;
-		evt->hdr.event_type = EVT_QUIESCENT;
-		evt->hdr.flags = 0;
+		fill_hdr(&evt->hdr, p, EVT_QUIESCENT);
 		evt->deq_flags = (u32)deq_flags;
 		evt->pad = 0;
 		rb_submit(evt);
 	} else {
 		rb_drop_inc();
 	}
+}
+
+/*
+ * Per-task identity notification.
+ *
+ * SLEEPABLE because BPF_CORE_READ_INTO over `p->comm` may fault on a
+ * very fresh task_struct, and the spec requires we never abort a
+ * fork from this path (always return 0). Sched_ext explicitly
+ * permits init_task to sleep — see kernel/sched/ext_internal.h
+ * around scx_init_task_args.
+ *
+ * Fires twice in this scheduler's lifecycle:
+ *   1. for every existing in-system task during scheduler attach
+ *      (the synchronous pass at __scx_init_task call sites in
+ *      kernel/sched/ext.c);
+ *   2. on every fork once attached.
+ * The userspace recorder treats both identically — snapshot
+ * /proc/<pid>/{maps, cmdline} on receipt.
+ *
+ * NOT cgroup-gated. Even if filtering is on, we still want the
+ * proc-table entry for any task we might later see scheduling
+ * events for via the cgroup gate (which the analyzer needs for
+ * symbolization). The cost is one ringbuf entry per existing task
+ * at attach plus per fork — well under the steady-state event rate.
+ */
+s32 BPF_STRUCT_OPS_SLEEPABLE(invariant_init_task, struct task_struct *p,
+			     struct scx_init_task_args *args)
+{
+	if (!p)
+		return 0;
+
+	u32 cpu = bpf_get_smp_processor_id();
+	struct evt_proc_new *e = rb_reserve(cpu, sizeof(*e));
+	if (!e) {
+		rb_drop_inc();
+		return 0;
+	}
+
+	fill_hdr(&e->hdr, p, EVT_PROC_NEW);
+	e->ppid = BPF_CORE_READ(p, real_parent, tgid);
+	/*
+	 * Direct CO-RE read of the in-kernel comm field (16 bytes,
+	 * fixed-size). Cheaper than bpf_probe_read_kernel_str and
+	 * avoids the CAP_PERFMON-gated helper. Per work/task.md Q&A:
+	 * the in-kernel p->comm is authoritative — userspace MUST NOT
+	 * fall back to /proc/<pid>/comm for short-lived tasks.
+	 */
+	BPF_CORE_READ_INTO(&e->comm, p, comm);
+	e->pad[0] = 0;
+	e->pad[1] = 0;
+	e->pad[2] = 0;
+	rb_submit(e);
+	return 0;
+}
+
+/*
+ * Exec notification.
+ *
+ * tp_btf attach (not a sched_ext op). Two responsibilities:
+ *   1. Flag "this PID's /proc/<pid>/maps just changed" — the
+ *      userspace recorder re-reads maps and cmdline on receipt.
+ *   2. Re-emit the in-kernel `task->comm` for this PID. EVT_PROC_NEW
+ *      captured comm at fork time, which is the *pre*-exec value
+ *      inherited from the parent across `clone()`; execve has just
+ *      rewritten it to the new binary's basename. Without this
+ *      refresh, a workload spawned by `scx_invariant record -- ...`
+ *      is rendered under the recorder's comm forever. See
+ *      work/changelog.md 2026-05-12 (post-exec comm refresh).
+ *
+ * Tracepoints attached via tp_btf run AFTER `__set_task_comm` /
+ * `setup_new_exec` in the execve path (`bprm_execve` →
+ * `exec_binprm` → `search_binary_handler` → format handler →
+ * `setup_new_exec` → setting comm → `trace_sched_process_exec`).
+ * So `p->comm` here is the new post-exec value, which is exactly
+ * what the analyzer needs.
+ *
+ * Fires on every successful exec; we do not gate on cgroup
+ * membership here for the same reason as invariant_init_task.
+ *
+ * Tracepoint signature lifted from
+ * include/trace/events/sched.h:sched_process_exec.
+ */
+SEC("tp_btf/sched_process_exec")
+int BPF_PROG(invariant_proc_exec, struct task_struct *p, u32 old_pid,
+	     struct linux_binprm *bprm)
+{
+	if (!p)
+		return 0;
+
+	u32 cpu = bpf_get_smp_processor_id();
+	struct evt_proc_exec *e = rb_reserve(cpu, sizeof(*e));
+	if (!e) {
+		rb_drop_inc();
+		return 0;
+	}
+
+	fill_hdr(&e->hdr, p, EVT_PROC_EXEC);
+	BPF_CORE_READ_INTO(&e->comm, p, comm);
+	rb_submit(e);
+	return 0;
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(invariant_init)
@@ -394,6 +551,7 @@ SCX_OPS_DEFINE(invariant_ops,
 	       .running   = (void *)invariant_running,
 	       .stopping  = (void *)invariant_stopping,
 	       .quiescent = (void *)invariant_quiescent,
+	       .init_task = (void *)invariant_init_task,
 	       .init      = (void *)invariant_init,
 	       .exit      = (void *)invariant_exit,
 	       .flags     = SCX_OPS_ENQ_LAST | SCX_OPS_ENQ_EXITING,

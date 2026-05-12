@@ -214,17 +214,62 @@ decoding offline.
 │    Reader can skip unknown event types by jumping        │
 │    payload_len bytes forward (forward-compatible).        │
 ├──────────────────────────────────────────────────────────┤
-│  Process Table (section_type = 0x0002, at finalize)      │
+│  ProcMaps Section (section_type = 0x0004, at finalize)   │
 │  ──────────────────────────────                          │
 │    section_type (u16) + section_len (u32)                │
-│    Per-pid entries (20 bytes each):                      │
-│      pid (u32), comm (16 bytes ASCII)                    │
-│    Written after events stop, from PIDs seen in trace.   │
+│    Per-pid record (variable):                            │
+│      pid (u32), n_maps (u16), flags (u16)                │
+│      n_maps × {                                          │
+│        vm_start (u64), vm_end (u64), vm_pgoff (u64),     │
+│        dso_inode (u64),                                  │
+│        path_len (u16), path (path_len bytes)             │
+│      }                                                   │
+│    flags bit assignments (stable; PROC_FLAG_* in         │
+│      src/output.rs and analysis/trace.py):               │
+│      0x0001 NO_MAPS                — both /proc/<pid>    │
+│                                       and /proc/<ppid>   │
+│                                       were gone          │
+│      0x0002 PARTIAL_IDENTITY       — proc-new ringbuf    │
+│                                       record was dropped │
+│      0x0004 INHERITED_FROM_PARENT  — /proc/<pid> gone,   │
+│                                       used /proc/<ppid>  │
+│                                       maps as stand-in   │
+│                                       (the dominant      │
+│                                       outcome for sub-ms │
+│                                       fork→exit tasks;   │
+│                                       see notes 2026-05- │
+│                                       12 reviewer fix)   │
+│    flags slot was zero-filled `pad` in pre-2026-05-12 v2 │
+│    traces; old traces decode as "all clear", which is    │
+│    the correct historical reading.                       │
+│    Captured at EVT_PROC_NEW / EVT_PROC_EXEC.             │
+├──────────────────────────────────────────────────────────┤
+│  ProcStacks Section (section_type = 0x0005, at finalize) │
+│  ──────────────────────────────                          │
+│    section_type (u16) + section_len (u32)                │
+│    Per-stack record (variable):                          │
+│      stack_id (u32), depth (u8), pad (u8 × 3)            │
+│      depth × ip (u64)                                    │
+│    Userspace-side stack-id dedup table (Option-A;        │
+│    bpf_get_stackid is unavailable to sched_ext           │
+│    struct_ops, so deduplication happens in the recorder  │
+│    rather than in the kernel via BPF_MAP_TYPE_STACK_TRACE│
+│    — see work/notes.md 2026-05-12).                      │
 └──────────────────────────────────────────────────────────┘
 ```
 
+**Section ID ledger**:
+- `0x0001` SECTION_TOPOLOGY  — per-CPU topology
+- `0x0002` retired             — was SECTION_PROCS; the pid → comm
+                                 mapping is now reconstructed from the
+                                 EVT_PROC_NEW event stream. Slot is
+                                 permanently retired; do not re-use.
+- `0x0003` SECTION_EVENTS    — packed event TLVs
+- `0x0004` SECTION_PROC_MAPS — per-PID executable mappings (added 2026-05-12)
+- `0x0005` SECTION_PROC_STACKS — stack-id → IP[] table (added 2026-05-12)
+
 **v2 format**: event IDs live at `0x0100+` (see §6) and section IDs stay at
-`0x0001..0x0003`. The two namespaces no longer overlap, so a `u16` type read
+`0x0001..0x00FF`. The two namespaces no longer overlap, so a `u16` type read
 inside the events section is unambiguously either an event TLV or the next
 section header. The v1 payload-size heuristic that this fixed (and its
 two-PID phantom-event bug) is gone; the reader now requires both a known
@@ -254,6 +299,18 @@ struct scx_invariant_event {
 | EVT_STOPPING | 0x0101 | 88 B | Task stopped executing | Done |
 | EVT_RUNNABLE | 0x0102 | 40 B | Task became runnable (woke up) | Done |
 | EVT_QUIESCENT | 0x0103 | 32 B | Task went to sleep | Done |
+| EVT_PROC_NEW | 0x0104 | 56 B | Per-task identity (ops.init_task) | Done (2026-05-12) |
+| EVT_PROC_EXEC | 0x0105 | 24 B | Exec notification (tp_btf/sched_process_exec) | Done (2026-05-12) |
+| EVT_SAMPLE | 0x0106 | 32 B | Per-quantum user-stack sample (disk form) | Done (2026-05-12) |
+
+`EVT_SAMPLE` is the one event whose BPF→userspace wire form differs
+from its on-disk form: BPF emits 160 B carrying the inline
+`ip[STACK_DEPTH_MAX]`; the recorder hashes them into a userspace
+stack-id table and writes a 32 B record on disk. Stack-id dedup happens
+in the recorder rather than kernel-side because `bpf_get_stackid()` is
+not callable from sched_ext struct_ops programs (the kernel only
+exposes that helper to programs whose context provides `pt_regs *`).
+See `work/notes.md` 2026-05-12 for the full rationale.
 
 Flags (`scx_invariant_event.flags`):
 - `FLAG_MIGRATED` (1<<0) — task is on a different CPU than last run
@@ -300,8 +357,21 @@ the format defines no tick event: a tick boundary is not a state transition,
 so it does not belong in this state machine. If a future design needs to
 record at tick boundaries, it must arrive with its own spec (what is
 recorded, why `running` / `stopping` does not already cover it, and an ABI /
-format-evolution plan) and claim a fresh event ID — do not silently revive
-the old `0x0104` slot.
+format-evolution plan) and claim a fresh event ID at the next free slot
+(`0x0107+` — `0x0104..0x0106` are now claimed by Task 6).
+
+Historical note: `0x0104` was previously held by `EVT_TICK` (retired in
+commit `8431cc36`). When Task 6 (2026-05-12, stack-sample thread
+annotation) needed three new event IDs, the retirement was re-evaluated
+against the v2 ABI invariant: the TLV framing (`[type: u16][len: u16]`)
+makes per-ID reuse safe as long as the new event's payload size is
+distinct from the retired event's, and the analyzer rejects unknown
+types. We chose to claim `0x0104..0x0106` (`EVT_PROC_NEW`,
+`EVT_PROC_EXEC`, `EVT_SAMPLE`) consecutively rather than skip `0x0104`
+and start at `0x0105`, accepting the small cost that a hypothetical
+v2-with-EVT_TICK consumer would mis-parse `EVT_PROC_NEW` as a tick
+record — no such consumer exists in tree, and v1/early-v2 traces are
+unsupported by the in-tree reader.
 
 ---
 
@@ -321,7 +391,14 @@ the old `0x0104` slot.
 │       ├── intf.h              # shared C types (BPF + Rust + Python)
 │       └── main.bpf.c          # BPF program: sched_ext_ops callbacks
 └── analysis/
-    └── reader.py               # Python parser for .scxi files
+    ├── reader.py               # Python parser for .scxi files
+    ├── trace.py                # shared decoder primitives
+    ├── report.py               # HTML report renderer
+    ├── symbolizer.py           # (pid,ip) → fn name via addr2line
+    │                           # (added 2026-05-12)
+    ├── test_reader.py          # v2 + new-section regression tests
+    └── test_symbolizer.py      # mapping lookup + addr2line tests
+                                # (added 2026-05-12)
 ```
 
 `cgroup.rs` (Task 3) lives in tree:
@@ -351,16 +428,25 @@ PMU counters from BPF.
 | 4b | Wakeup attribution | select_cpu callback; waker fields in EVT_RUNNING | Done |
 | 4c | Process-only waker filter | scx-only filter in select_cpu drops idle/IRQ/softirq/NMI/kthread/workqueue/IO-worker wakers (waker_pid=0) | Done |
 | 5 | PMU integration | perf_event_open per CPU; PMU reads in running/stopping; also populate `cpu_perf` from `scx_bpf_cpuperf_cur()` | Reverted (reserved-zero in v2 ABI; see 2026-05-11 cleanup) |
+| 6 | Stack-sample thread annotation | EVT_PROC_NEW/EXEC/SAMPLE events; ProcMaps + ProcStacks sections; userspace symbolizer; wakeup-graph node hot-stack labels; new "Thread stack profile" section | Done (2026-05-12) |
 
 **Recommended next order** for the remaining work:
 
-1. *(none)* — all in-scope roadmap tasks have landed for the current
-   focus (scheduling transitions + waker-wakee topology). PMU
-   collection (Task 5) was removed and the slots remain reserved-zero
-   in the v2 event ABI. There is no `ops.tick()` hook in tree; if a
-   future design wants tick-boundary recording, it must arrive with
-   its own spec and claim a fresh event ID (do not reuse the old
-   `0x0104` slot).
+1. *(none)* — all in-scope roadmap tasks have landed. Task 6
+   (stack-sample thread annotation, 2026-05-12) added the per-quantum
+   user-stack capture, the userspace addr2line-backed symbolizer, the
+   wakeup-graph hot-stack annotations, and the per-thread stack-profile
+   section of the HTML report. PMU collection (Task 5) remains
+   reverted (reserved-zero in the v2 ABI). There is no `ops.tick()`
+   hook in tree; if a future design wants tick-boundary recording, it
+   must arrive with its own spec and claim a fresh event ID
+   (`0x0107+` — `0x0104..0x0106` are now claimed by Task 6).
+
+A nice-to-have follow-up that the 2026-05-12 task surfaced but
+deliberately did not attempt: an upstream sched_ext kfunc that wraps
+`bpf_get_stackid()` so future schedulers can use kernel-side
+stack-trace dedup (the "Option D" path documented in
+`work/notes.md` 2026-05-12). Out of scope for this repo.
 
 Task 3 (cgroup filtering) landed in two passes: BPF-side gating with rodata
 `cgroup_filtering` / `target_cgid` and `is_target_task(p)` was committed
@@ -482,8 +568,8 @@ compilation cycle when adding new analysis.
 Each event has `[type: u16][len: u16]` prefix before its payload. **Within a
 major file version** this makes the format forward-compatible: a v2 reader
 can skip event types it does not understand by jumping `len` bytes forward,
-so a producer that adds a new event type at the next free ID (`0x0104`) does
-not break older v2 readers.
+so a producer that adds a new event type at the next free ID (`0x0107+`,
+with `0x0104..0x0106` claimed by Task 6) does not break older v2 readers.
 
 The major version field in the file header (`output.rs::VERSION`) is the
 escape hatch for changes that TLV cannot absorb — header layout, section

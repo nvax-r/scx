@@ -47,3 +47,5 @@ We MUST use sub-agent development pattern with Test Driven Development mode.
 ## MUST NOT
 - Commit by yourself
 - When you finish a partial of the work, stop and report that you finish your task and claude code will review for you
+- Change plan.md, task.md
+- When you feel some other implementation might be better, stop and report so I can discuss with you

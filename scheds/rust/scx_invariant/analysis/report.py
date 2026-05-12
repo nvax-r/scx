@@ -2,19 +2,29 @@
 """
 report.py — Render an HTML report from an scx_invariant `.scxi` trace.
 
-Section 1 (Overview) is populated from the file header and parsed event
-counts. Sections 2–7 are titled stubs that later tasks fill in:
+Sections rendered by this module:
 
-  §2 CPU heatmap          — Task 3
-  §3 Thread timeline      — Task 4
-  §4 Wakeup graph         — Task 5
-  §5 Latency histograms   — Task 3 (alongside heatmap chart work)
-  §6 Migration breakdown  — Task 6
-  §7 Per-thread table     — Task 6
+  §1 Overview             — file header + event counts
+  §2 CPU heatmap          — per-CPU busy fraction over time
+  §3 Thread timeline      — per-PID swim-lane (running/runnable/sleeping)
+  §3.5 Thread stack profile — top-N hot stacks per PID (2026-05-12 task)
+  §4 Wakeup graph         — directed graph of waker → wakee edges,
+                            now annotated with hot-stack frames
+  §5 Latency histograms   — stub
+  §6 Migration breakdown  — stub
+  §7 Per-thread table     — stub
 
-Stdlib only at this stage; no matplotlib, no graphviz, no external
-assets in the rendered HTML (CSS is inlined; favicon is an empty data
-URI to suppress the 404 in browser DevTools).
+The 2026-05-12 stack-sample task added §3.5 (Thread stack profile)
+plus per-node hot-stack annotation on §4 (Wakeup graph) and a
+two-pass entry: pass 1 builds the proc table from the EVT_PROC_NEW /
+EVT_PROC_EXEC stream (since SECTION_PROCS 0x0002 is retired), then
+pass 2 renders everything else with the proc table in hand.
+
+Stdlib + matplotlib at this stage; no graphviz dep is required for
+the report to render (the wakeup graph fails soft to a .dot sidecar
+when `dot` is missing). The new symbolizer module pulls in
+`addr2line` from the host binutils — also a soft dep, missing
+binaries fall back to `dso+0xoffset`.
 
 Usage:
     python3 analysis/report.py <trace.scxi> [-o <report.html>]
@@ -27,6 +37,7 @@ import datetime
 import html
 import os
 import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 
 # Sibling import; same idiom reader.py / test_reader.py use to keep
@@ -34,6 +45,131 @@ from pathlib import Path
 # script-execution context (e.g. from a notebook in the repo root).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import trace  # noqa: E402
+import symbolizer as symbolizer_mod  # noqa: E402
+
+
+def build_proc_table(events):
+    """Pass-1 reconstruction of {pid: {comm, ppid, execs}} from events.
+
+    Mirrors `reader.build_proc_table`. Local copy to avoid pulling
+    `reader.py` (a CLI script) as a dependency from `report.py`.
+    Promote to `trace.py` if a third caller appears.
+
+    Comm-source policy:
+      * EVT_PROC_NEW seeds {comm, ppid} for fresh PIDs.
+      * EVT_PROC_EXEC overwrites comm when the payload carries one
+        (post-2026-05-12 traces). Old 24 B EVT_PROC_EXEC records
+        decode without a `comm` key and we leave the prior value
+        intact — that's correct historical behavior.
+      * Multiple execs in the same PID lifetime each update comm to
+        the most-recent post-exec value, which is what an operator
+        expects when watching a shell `exec ls`-style chain.
+
+    The exec-time refresh is what makes spawn-mode workloads render
+    under their real name. Without it, a `record -- nvbandwidth ...`
+    child shows up as "scx_invariant" (the parent's pre-exec comm
+    that EVT_PROC_NEW captured at fork). See work/changelog.md
+    2026-05-12 (post-exec comm refresh).
+    """
+    table = {}
+    for evt_type, payload in events:
+        parsed = trace.parse_event(evt_type, payload)
+        if not parsed:
+            continue
+        pid = parsed["pid"]
+        if evt_type == trace.EVT_PROC_NEW:
+            table[pid] = {
+                "comm": parsed.get("comm", ""),
+                "ppid": parsed.get("ppid", 0),
+                "execs": 0,
+            }
+        elif evt_type == trace.EVT_PROC_EXEC:
+            entry = table.setdefault(pid, {"comm": "?", "ppid": 0, "execs": 0})
+            entry["execs"] += 1
+            new_comm = parsed.get("comm")
+            if new_comm:
+                entry["comm"] = new_comm
+    return table
+
+
+def hot_stacks_per_pid(events, proc_stacks):
+    """Histogram EVT_SAMPLE stack_ids per PID; return sorted hot lists.
+
+    Returns {pid: [(stack_id, count), ...]} with each list sorted
+    descending by count. Negative `stack_id` (BPF walk failure) and
+    stack_ids not present in `proc_stacks` are filtered out.
+
+    Per design §6 — hot stack = most-common `stack_id` per PID.
+    Top 3 frames of that stack become the wakeup-graph node label.
+    """
+    counts = defaultdict(Counter)
+    for evt_type, payload in events:
+        if evt_type != trace.EVT_SAMPLE:
+            continue
+        parsed = trace.parse_event(evt_type, payload)
+        if not parsed:
+            continue
+        sid = parsed.get("stack_id", 0)
+        if sid < 0:
+            continue
+        if sid not in proc_stacks:
+            continue
+        counts[parsed["pid"]][sid] += 1
+    return {pid: c.most_common() for pid, c in counts.items()}
+
+
+def derive_pid_tags(proc_table, proc_maps, proc_stacks, proc_flags=None):
+    """Compute per-PID quality tags surfaced in the report.
+
+    Returns {pid: set[str]} with tags from {"partial-identity",
+    "stale-maps after exec", "inherited-from-parent", "no-maps"}.
+    See design §7 fallback states.
+
+    Tag sources in priority order:
+
+    1. Recorder-authoritative `proc_flags` (added 2026-05-12). The
+       recorder now serializes `{no_maps, partial_identity,
+       inherited_from_parent}` directly into SECTION_PROC_MAPS, so we
+       no longer have to derive the partial-identity case from
+       missing-EVT_PROC_NEW heuristics. `inherited-from-parent` is
+       the dominant case for sub-millisecond fork-then-exit tasks
+       where /proc/<pid> died before the recorder could read it and
+       /proc/<ppid> was used as a stand-in (this is correct — child
+       mm is COW-copied or shared from parent at fork time).
+
+    2. Heuristic `partial-identity` for traces produced before the
+       recorder grew the explicit flag (proc_flags missing or all
+       zero for a PID): PIDs in `proc_maps` but not in `proc_table`
+       are assumed dropped-EVT_PROC_NEW.
+
+    3. Heuristic `stale-maps after exec`: any PID with `execs > 0`
+       that has no executable mappings in `proc_maps` is suspect.
+       Cross-checked against the `inherited-from-parent` flag — if
+       inherited_from_parent is set the empty-maps state is already
+       explained by the fork-time fallback, so we don't double-tag.
+    """
+    tags = defaultdict(set)
+    proc_flags = proc_flags or {}
+
+    for pid in proc_maps:
+        f = proc_flags.get(pid, 0)
+        if f & getattr(trace, "PROC_FLAG_INHERITED_FROM_PARENT", 0):
+            tags[pid].add("inherited-from-parent")
+        if f & getattr(trace, "PROC_FLAG_PARTIAL_IDENTITY", 0):
+            tags[pid].add("partial-identity")
+        if f & getattr(trace, "PROC_FLAG_NO_MAPS", 0):
+            tags[pid].add("no-maps")
+        # Heuristic backstop: pre-flag traces had no recorder-side
+        # signal, so fall back to the missing-EVT_PROC_NEW check.
+        if not f and pid not in proc_table:
+            tags[pid].add("partial-identity")
+
+    for pid, entry in proc_table.items():
+        if entry["execs"] > 0:
+            maps = proc_maps.get(pid, [])
+            if not maps and "inherited-from-parent" not in tags[pid]:
+                tags[pid].add("stale-maps after exec")
+    return tags
 
 
 # Local copy of reader.py's helper. trace.py and reader.py are
@@ -237,6 +373,80 @@ section h2 {
   overflow-x: auto;
   max-width: 100%;
 }
+/* Stack profile (§3.5) — one collapsible block per top-N PID,
+   each containing a top-stacks table.  partial-identity / stale-maps
+   PIDs get a yellow tint per design §7. */
+.stack-profile-empty { color: #888; font-style: italic; }
+.stack-profile-banner {
+  font-size: 0.85rem;
+  color: #555;
+  margin: 0 0 0.5rem;
+  font-style: italic;
+}
+details.stack-pid {
+  margin: 0.5rem 0;
+  border: 1px solid #e5e5e5;
+  border-radius: 4px;
+  background: #fff;
+}
+details.stack-pid.tagged {
+  background: #fffbeb;
+  border-color: #fcd34d;
+}
+details.stack-pid summary {
+  padding: 0.4rem 0.7rem;
+  cursor: pointer;
+  font-family: monospace;
+  font-size: 0.9rem;
+}
+details.stack-pid summary .tag {
+  display: inline-block;
+  background: #fef3c7;
+  color: #92400e;
+  border-radius: 3px;
+  padding: 0 0.3rem;
+  font-size: 0.7rem;
+  margin-left: 0.4rem;
+  letter-spacing: 0.02em;
+}
+table.stack-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+               Roboto, Helvetica, Arial, sans-serif;
+}
+table.stack-table th, table.stack-table td {
+  text-align: left;
+  padding: 0.25rem 0.6rem;
+  border-top: 1px solid #f0f0f0;
+  vertical-align: top;
+}
+table.stack-table th {
+  background: #f8f8f8;
+  font-weight: 500;
+  color: #444;
+  border-top: none;
+}
+table.stack-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+table.stack-table td.frame { font-family: monospace; }
+table.stack-table tr.full-stack td {
+  background: #fafafa;
+  color: #555;
+  font-family: monospace;
+  font-size: 0.78rem;
+  padding-top: 0;
+  padding-bottom: 0.5rem;
+}
+table.stack-table tr.full-stack pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
 footer {
   grid-column: 2;
   padding: 0 2rem 1.5rem;
@@ -251,13 +461,14 @@ footer {
 # must match the IDs the spec lists so future tasks can link into
 # specific sections.
 _TOC_ENTRIES = [
-    ("overview",   "Overview"),
-    ("heatmap",    "CPU heatmap"),
-    ("timeline",   "Thread timeline"),
-    ("wakeups",    "Wakeup graph"),
-    ("histograms", "Latency histograms"),
-    ("migrations", "Migration breakdown"),
-    ("threads",    "Per-thread table"),
+    ("overview",      "Overview"),
+    ("heatmap",       "CPU heatmap"),
+    ("timeline",      "Thread timeline"),
+    ("stack-profile", "Thread stack profile"),
+    ("wakeups",       "Wakeup graph"),
+    ("histograms",    "Latency histograms"),
+    ("migrations",    "Migration breakdown"),
+    ("threads",       "Per-thread table"),
 ]
 
 
@@ -999,17 +1210,60 @@ def _dot_escape(s: str) -> str:
              .replace("\t", " "))
 
 
-def _render_dot_source(edges: dict, procs: dict) -> str:
+_NODE_FRAME_TRUNCATE = 40
+_NODE_FRAMES_PER_PID = 3
+
+
+def _truncate(s: str, n: int) -> str:
+    """Truncate a string to n chars, ellipsis-marking when shortened."""
+    if len(s) <= n:
+        return s
+    if n <= 1:
+        return s[:n]
+    return s[: n - 1] + "…"
+
+
+def _node_hot_frames(pid: int, hot_stacks: dict, proc_stacks: dict,
+                     symbolizer) -> list:
+    """Symbolize the top-3 frames of the hottest stack for `pid`.
+
+    `hot_stacks` is the output of `hot_stacks_per_pid` — a dict of
+    pid → [(stack_id, count), ...]. We pick the most-common stack
+    id, look up its IPs in `proc_stacks`, and ask the symbolizer to
+    resolve each IP. Returns the first 3 frames, top-of-stack first.
+    Returns [] if the PID has no samples or the top stack is empty.
+    """
+    hot = hot_stacks.get(pid)
+    if not hot:
+        return []
+    top_sid, _count = hot[0]
+    ips = proc_stacks.get(top_sid, [])
+    if not ips:
+        return []
+    frames = []
+    for ip in ips[:_NODE_FRAMES_PER_PID]:
+        sym = symbolizer.resolve(pid, ip) if symbolizer else f"0x{ip:x}"
+        frames.append(_truncate(sym, _NODE_FRAME_TRUNCATE))
+    return frames
+
+
+def _render_dot_source(edges: dict, procs: dict, pid_tags: dict,
+                       hot_stacks: dict, proc_stacks: dict,
+                       symbolizer) -> str:
     """Build the dot source string for a (capped) edge dict.
+
+    Node label is rendered as `<pid>\\n<comm>\\n<top_fn>\\n↳ caller\\n↳ grand_caller`,
+    where the three frame lines come from the most-common EVT_SAMPLE
+    stack for that PID via `_node_hot_frames`. PIDs with quality
+    tags (partial-identity / stale-maps after exec) get a tinted
+    fillcolor so the operator can spot them at a glance.
 
     Node and edge styling:
       - rankdir=LR — waker→wakee reads left-to-right.
       - bgcolor=transparent — blends with the HTML section background.
-      - per-node color: hash-of-pid via _color_for_pid.
-      - node label: "<pid>\\n<comm>" or just "<pid>" when comm is
-        unknown.
-      - node width: 0.4 + 0.15 * log(total + 1), height auto so the
-        label always fits.
+      - per-node color: hash-of-pid via _color_for_pid; tagged PIDs
+        override to a yellow tint (#fde68a).
+      - node width: 0.4 + 0.15 * log(total + 1).
       - edge label: integer count.
       - edge penwidth: max(1.0, log(count + 1)).
       - edge color: single neutral slate (#94a3b8).
@@ -1039,14 +1293,20 @@ def _render_dot_source(edges: dict, procs: dict) -> str:
     # across runs and easier to test.
     for pid in sorted(pids):
         comm = procs.get(pid)
+        label_parts = [str(pid)]
         if comm:
-            label = f'{pid}\\n{_dot_escape(comm)}'
-        else:
-            label = str(pid)
+            label_parts.append(_dot_escape(comm))
+        frames = _node_hot_frames(pid, hot_stacks, proc_stacks, symbolizer)
+        for i, frame in enumerate(frames):
+            prefix = "" if i == 0 else "↳ "
+            label_parts.append(prefix + _dot_escape(frame))
+        label = "\\n".join(label_parts)
+
+        fillcolor = "#fde68a" if pid_tags.get(pid) else _color_for_pid(pid)
         width = 0.4 + 0.15 * math.log(totals.get(pid, 0) + 1)
         lines.append(
             f'  n{pid} [label="{label}", '
-            f'fillcolor="{_color_for_pid(pid)}", '
+            f'fillcolor="{fillcolor}", '
             f'width={width:.3f}];'
         )
 
@@ -1109,8 +1369,10 @@ def _write_dot_sidecar(out_path: str, dot_source: str) -> str:
 
 
 def _section_wakeups(hdr: dict, events: list, procs: dict,
-                     out_path: str) -> str:
-    """§4 — wakeup graph rendered via graphviz `dot`. Replaces the stub."""
+                     pid_tags: dict, hot_stacks: dict, proc_stacks: dict,
+                     symbolizer, out_path: str) -> str:
+    """§4 — wakeup graph rendered via graphviz `dot`. Now annotated with
+    per-node hot-stack frames per the 2026-05-12 stack-sample task."""
     edges = _collect_wakeup_edges(events)
 
     if not edges:
@@ -1136,7 +1398,8 @@ def _section_wakeups(hdr: dict, events: list, procs: dict,
     else:
         kept = edges
 
-    dot_source = _render_dot_source(kept, procs)
+    dot_source = _render_dot_source(kept, procs, pid_tags,
+                                    hot_stacks, proc_stacks, symbolizer)
     status, payload = _render_via_dot(dot_source)
 
     if status == "ok":
@@ -1184,16 +1447,139 @@ def _section_wakeups(hdr: dict, events: list, procs: dict,
     return "".join(parts)
 
 
+# --- §3.5 Thread stack profile -----------------------------------------------
+#
+# Per-PID hot-stack table. One <details> block per PID, sorted by total
+# sample count descending. Each block lists the top-N stacks (default
+# N=20) with three resolved frames per stack and an expandable full-stack
+# section showing all frames up to STACK_DEPTH_MAX. PIDs tagged
+# `partial-identity` or `stale-maps after exec` get a yellow tint.
+
+_STACK_PROFILE_TOP_N = 20
+_STACK_PROFILE_PIDS = 50      # cap on number of PIDs rendered, to keep
+                              # the page reasonable
+_STACK_PROFILE_FRAME_TRUNCATE = 120  # longer than the graph nodes —
+                                     # demangled C++/Rust names are long
+
+
+def _section_stack_profile(events: list, procs: dict, proc_stacks: dict,
+                            hot_stacks: dict, pid_tags: dict,
+                            symbolizer) -> str:
+    """§3.5 — Thread stack profile.
+
+    Per-PID hot-stack table. The HTML layout matches design §7:
+    one collapsible <details> per top-N PID with a top-N-stacks
+    table inside. The expander row shows the full stack (up to
+    STACK_DEPTH_MAX frames). Partial-identity / stale-maps PIDs
+    get a yellow tint.
+    """
+    # PIDs ranked by total sample count (sum across all their stacks).
+    totals = []
+    for pid, hot in hot_stacks.items():
+        total = sum(c for _, c in hot)
+        totals.append((pid, total))
+    totals.sort(key=lambda kv: (-kv[1], kv[0]))
+
+    if not totals:
+        return (
+            '<section id="stack-profile">\n'
+            '  <h2>Thread stack profile</h2>\n'
+            '  <p class="stack-profile-empty">no stack samples '
+            '(EVT_SAMPLE) recorded</p>\n'
+            '</section>'
+        )
+
+    rendered_pids = totals[:_STACK_PROFILE_PIDS]
+    banner_html = ""
+    if len(totals) > _STACK_PROFILE_PIDS:
+        banner_html = (
+            f'<p class="stack-profile-banner">showing top '
+            f'{_STACK_PROFILE_PIDS} of {len(totals)} sampled PIDs '
+            f'(by total sample count)</p>'
+        )
+
+    parts = ['<section id="stack-profile">\n',
+             '  <h2>Thread stack profile</h2>\n']
+    if banner_html:
+        parts.append(f'  {banner_html}\n')
+
+    for pid, total in rendered_pids:
+        comm = procs.get(pid, "?")
+        tags = sorted(pid_tags.get(pid, set()))
+        tag_class = " tagged" if tags else ""
+        tag_html = "".join(
+            f'<span class="tag">{html.escape(t)}</span>' for t in tags
+        )
+        parts.append(
+            f'  <details class="stack-pid{tag_class}">\n'
+            f'    <summary>'
+            f'pid={pid} comm={html.escape(str(comm))} '
+            f'samples={total}{tag_html}'
+            f'</summary>\n'
+        )
+
+        hot_for_pid = hot_stacks[pid][:_STACK_PROFILE_TOP_N]
+        parts.append('    <table class="stack-table">\n')
+        parts.append(
+            '      <tr><th>#</th><th class="num">samples</th>'
+            '<th>top frame</th><th>caller</th><th>grand-caller</th></tr>\n'
+        )
+
+        for rank, (sid, count) in enumerate(hot_for_pid, start=1):
+            ips = proc_stacks.get(sid, [])
+            pct = (100.0 * count / total) if total else 0.0
+            frames = []
+            for ip in ips[:3]:
+                sym = symbolizer.resolve(pid, ip)
+                frames.append(_truncate(sym, _STACK_PROFILE_FRAME_TRUNCATE))
+            while len(frames) < 3:
+                frames.append("")
+            parts.append(
+                f'      <tr>'
+                f'<td class="num">{rank}</td>'
+                f'<td class="num">{count} ({pct:.1f}%)</td>'
+                f'<td class="frame">{html.escape(frames[0])}</td>'
+                f'<td class="frame">{html.escape(frames[1])}</td>'
+                f'<td class="frame">{html.escape(frames[2])}</td>'
+                f'</tr>\n'
+            )
+            full = []
+            for depth, ip in enumerate(ips):
+                sym = symbolizer.resolve(pid, ip)
+                full.append(f"  #{depth:<2} 0x{ip:016x}  {sym}")
+            if full:
+                parts.append(
+                    '      <tr class="full-stack">'
+                    '<td colspan="5">'
+                    f'<pre>{html.escape(chr(10).join(full))}</pre>'
+                    '</td></tr>\n'
+                )
+
+        parts.append('    </table>\n')
+        parts.append('  </details>\n')
+
+    parts.append('</section>')
+    return "".join(parts)
+
+
 def _render(trace_path: str, hdr: dict, topology: list,
-            events: list, procs: dict, out_path: str) -> str:
+            events: list, procs: dict, proc_maps: dict, proc_stacks: dict,
+            pid_tags: dict, hot_stacks: dict, symbolizer,
+            out_path: str) -> str:
     sections = [_section_overview(trace_path, hdr, events, procs)]
     for sid, title in _TOC_ENTRIES[1:]:
         if sid == "timeline":
             sections.append(_section_timeline(hdr, events, procs))
         elif sid == "heatmap":
             sections.append(_section_heatmap(hdr, topology, events))
+        elif sid == "stack-profile":
+            sections.append(_section_stack_profile(
+                events, procs, proc_stacks, hot_stacks, pid_tags,
+                symbolizer))
         elif sid == "wakeups":
-            sections.append(_section_wakeups(hdr, events, procs, out_path))
+            sections.append(_section_wakeups(
+                hdr, events, procs, pid_tags, hot_stacks, proc_stacks,
+                symbolizer, out_path))
         else:
             sections.append(_section_stub(sid, title))
 
@@ -1255,8 +1641,29 @@ def main() -> int:
     try:
         data = Path(args.trace).read_bytes()
         hdr = trace.read_header(data)
-        topology, events, procs = trace.read_sections(data, hdr["header_size"])
-        rendered = _render(args.trace, hdr, topology, events, procs, out)
+        topology, events, proc_maps, proc_stacks, proc_flags, _raw_log = (
+            trace.read_sections(data, hdr["header_size"])
+        )
+        # Two-pass entry per design §6: pass-1 builds the proc table
+        # from EVT_PROC_NEW / EVT_PROC_EXEC; everything else reads
+        # the resulting maps with a full proc identity in hand.
+        proc_table = build_proc_table(events)
+        procs = {pid: entry["comm"] for pid, entry in proc_table.items()}
+        # Fold in any PIDs known only via /proc snapshot fallback so
+        # the wakeup graph has a comm even for partial-identity PIDs
+        # (the recorder's first-sight snapshot fired snapshot_proc
+        # which does NOT capture comm — we fall back to the cmdline
+        # leading basename, then to "?").
+        for pid in proc_maps:
+            if pid not in procs:
+                procs[pid] = "?"
+        pid_tags = derive_pid_tags(proc_table, proc_maps, proc_stacks,
+                                   proc_flags)
+        hot = hot_stacks_per_pid(events, proc_stacks)
+        with symbolizer_mod.Symbolizer(proc_maps) as sym:
+            rendered = _render(args.trace, hdr, topology, events, procs,
+                               proc_maps, proc_stacks, pid_tags, hot,
+                               sym, out)
     except trace.UnsupportedVersionError as e:
         print(f"report.py: {e}", file=sys.stderr)
         return 1
