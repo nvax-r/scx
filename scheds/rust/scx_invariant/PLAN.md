@@ -23,10 +23,16 @@ Phase 1 captures **scheduler-invariant workload identity** — properties of a
 workload that do not depend on which scheduler is running:
 
 - **Wakeup graph topology** (who wakes whom, sync vs async)
-- **Computational character per task** (IPC, cache behavior, pipeline stalls)
 - **Phase structure** (which phases exist, their sequence)
 - **Task lifecycle** (which threads exist, when they spawn and exit)
 - **Blocking patterns** (voluntary sleep frequency, sleep durations)
+
+PMU-derived computational character (IPC, cache behavior, pipeline
+stalls) is intentionally **out of scope** for the current recorder.
+PMU collection was implemented in Task 5 and then removed; the
+historical `cpu_perf` and `pmc_*` slots in the v2 event ABI remain as
+RESERVED-ZERO for stability and possible future reuse. See work
+changelog for the 2026-05-11 reserved-zero PMU cleanup.
 
 These are the workload's intrinsic behavior, stripped of scheduler opinion.
 To explain why scheduler X beat scheduler Y on a workload, you first need to
@@ -37,13 +43,16 @@ know **what the workload IS** — that is what this tool captures.
 
 Phase 1 records the **full event stream** — every scheduling transition for
 every task in the target scope, with all annotations the BPF callbacks can
-reach (timestamps, CPU, slice usage, wakeup attribution, PMU counters, etc.).
-The goal is to capture **everything** about each task's scheduling behavior
-so nothing has to be re-collected later. **Analysis is explicitly out of scope
-for Phase 1** — it is a separate phase that consumes the `.scxi` traces
-offline. The reader (`analysis/reader.py`) ships a minimal summary purely to
-validate the data pipeline; real analysis (workload fingerprinting, phase
-detection, scheduler diffs) waits until the next phase.
+reach (timestamps, CPU, slice usage, wakeup attribution, etc.). The
+PMU-shaped event slots remain in the v2 ABI but are RESERVED-ZERO; PMU
+collection is no longer active.
+The goal is to capture **everything about scheduling behavior** about each
+task so nothing has to be re-collected later. **Analysis is explicitly out
+of scope for Phase 1** — it is a separate phase that consumes the `.scxi`
+traces offline. The reader (`analysis/reader.py`) ships a minimal summary
+purely to validate the data pipeline; real analysis (workload
+fingerprinting, phase detection, scheduler diffs) waits until the next
+phase.
 
 
 ---
@@ -108,7 +117,8 @@ detection, scheduler diffs) waits until the next phase.
 │    - Topology by NUMA node                                           │
 │    - Per-thread top 20 by runtime                                    │
 │    - Migrations, voluntary/preempted ratio                           │
-│    - (planned) wakeup graph, IPC distributions, phase detection      │
+│    - Sleep durations, wakeup edges                                   │
+│    - (planned) phase detection, scheduler diff                       │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -314,13 +324,18 @@ the old `0x0104` slot.
     └── reader.py               # Python parser for .scxi files
 ```
 
-Both `cgroup.rs` (Task 3) and `pmu.rs` (Task 5) now exist in tree:
+`cgroup.rs` (Task 3) lives in tree:
 
 ```
 └── src/
-    ├── cgroup.rs               # cgroup setup + filtering (Task 3)
-    └── pmu.rs                  # perf_event_open + PMU map setup (Task 5)
+    └── cgroup.rs               # cgroup setup + filtering (Task 3)
 ```
+
+`pmu.rs` was removed in the 2026-05-11 reserved-zero PMU cleanup.
+The historical `cpu_perf` / `pmc_*` slots in `evt_running` and
+`evt_stopping` remain in the v2 ABI as RESERVED-ZERO; the recorder
+no longer opens perf events, holds perf-event-array maps, or reads
+PMU counters from BPF.
 
 ---
 
@@ -334,15 +349,18 @@ Both `cgroup.rs` (Task 3) and `pmu.rs` (Task 5) now exist in tree:
 | 3 | Cgroup filtering | bpf_task_under_cgroup() filter; cgroup.rs auto-setup; `record` subcommand with spawn + system-wide modes (attach mode deferred) | Done |
 | 4a | Sleep durations | runnable + quiescent callbacks; EVT_RUNNABLE/EVT_QUIESCENT | Done |
 | 4b | Wakeup attribution | select_cpu callback; waker fields in EVT_RUNNING | Done |
-| 5 | PMU integration | perf_event_open per CPU; PMU reads in running/stopping; also populate `cpu_perf` from `scx_bpf_cpuperf_cur()` | Done |
+| 4c | Process-only waker filter | scx-only filter in select_cpu drops idle/IRQ/softirq/NMI/kthread/workqueue/IO-worker wakers (waker_pid=0) | Done |
+| 5 | PMU integration | perf_event_open per CPU; PMU reads in running/stopping; also populate `cpu_perf` from `scx_bpf_cpuperf_cur()` | Reverted (reserved-zero in v2 ABI; see 2026-05-11 cleanup) |
 
 **Recommended next order** for the remaining work:
 
-1. *(none)* — all roadmap tasks have landed. The PMU truth path lives
-   exclusively in `running` / `stopping` (Task 5). There is no `ops.tick()`
-   hook in tree; if a future design wants tick-boundary recording, it must
-   arrive with its own spec and claim a fresh event ID (do not reuse the
-   old `0x0104` slot).
+1. *(none)* — all in-scope roadmap tasks have landed for the current
+   focus (scheduling transitions + waker-wakee topology). PMU
+   collection (Task 5) was removed and the slots remain reserved-zero
+   in the v2 event ABI. There is no `ops.tick()` hook in tree; if a
+   future design wants tick-boundary recording, it must arrive with
+   its own spec and claim a fresh event ID (do not reuse the old
+   `0x0104` slot).
 
 Task 3 (cgroup filtering) landed in two passes: BPF-side gating with rodata
 `cgroup_filtering` / `target_cgid` and `is_target_task(p)` was committed
@@ -378,10 +396,15 @@ For every thread in the workload:
 - Migration history — which CPUs, how often, cross-LLC / cross-NUMA breakdown
 - Voluntary vs involuntary context-switch ratio
 - Slice utilization — how much of the allocated slice was actually used
-- Per-quantum PMU profile — IPC, L2 miss rate, backend stall breakdown
 - Sleep duration distribution — how long the thread blocks. The "on what signal"
   detail (futex address, IO fd, etc.) requires tracking syscalls or blocker state
   beyond sched_ext callbacks and is deferred to a Phase 2 expansion.
+
+(Per-quantum PMU profile — IPC, L2 miss rate, backend stall breakdown —
+was on the original roadmap and would slot back in here. Currently the
+recorder does not emit PMU data; the v2 event slots are RESERVED-ZERO
+and a future task would need to re-establish a PMU collection path
+before this analysis becomes available.)
 
 ### Per-Workload Analysis
 
@@ -391,9 +414,11 @@ For the application as a whole (all threads / processes in the PID tree):
   frequencies, sync vs async classification, latency per edge
 - Communication patterns — producer/consumer chains, fan-in / fan-out hubs
 - Phase detection — distinct behavioral segments over time
-- Aggregate IPC and stall accounting across threads
 - Load balance across CPUs / NUMA nodes
 - Bottleneck identification — which thread's wait time dominates?
+
+(Aggregate IPC / backend-stall accounting requires PMU data that the
+current recorder does not collect; see the per-task note above.)
 
 ### Visualizations
 

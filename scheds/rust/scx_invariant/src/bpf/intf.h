@@ -38,25 +38,33 @@ struct scx_invariant_event {
     u16 flags;
 };
 
+/*
+ * cpu_perf and pmc_* are RESERVED-ZERO in the current recorder.
+ *
+ * The fields remain in the v2 ABI for stability — struct sizes
+ * (88 B for both evt_running and evt_stopping) and field offsets
+ * are frozen, so existing v2 readers and existing v2 traces keep
+ * working unchanged. Writers MUST emit zeros and readers SHOULD
+ * ignore them unless a future task explicitly reclaims the slots
+ * with documented semantics.
+ *
+ * Historical context: these slots once held a per-quantum PMU
+ * profile (instructions / cycles / L2 refills / backend-stall
+ * cycles) plus a normalized [1, SCX_CPUPERF_ONE] frequency hint
+ * (cpu_perf). PMU collection was removed when the project focus
+ * shifted to waker-wakee topology. See work/changelog.md
+ * 2026-05-11 "reserved-zero PMU cleanup".
+ */
 struct evt_running {
     struct scx_invariant_event hdr;
     u64 runq_wait_ns;
     u32 waker_pid;
     u32 waker_tgid;
     u16 waker_flags;
-    u16 cpu_perf;            /* normalized [1, SCX_CPUPERF_ONE] hint */
+    u16 cpu_perf;            /* RESERVED-ZERO; see comment above */
     s32 prev_cpu;
     u64 wake_flags;
-    /*
-     * pmc_* below are RESERVED-ZERO in evt_running.
-     *
-     * Per-quantum counter deltas live exclusively in evt_stopping.
-     * Putting raw start-of-quantum snapshots here would mean the same
-     * field name carried two different physical units across event
-     * types in this shared format — a footgun for any aggregator that
-     * sums across all events. Slots are kept for format stability;
-     * writers MUST emit zeros and readers SHOULD ignore.
-     */
+    /* pmc_* below are RESERVED-ZERO; see comment above */
     u64 pmc_instructions;
     u64 pmc_cycles;
     u64 pmc_l2_misses;
@@ -66,6 +74,7 @@ struct evt_running {
 struct evt_stopping {
     struct scx_invariant_event hdr;
     u64 runtime_ns;
+    /* pmc_* below are RESERVED-ZERO; see comment above evt_running */
     u64 pmc_instructions;
     u64 pmc_cycles;
     u64 pmc_l2_misses;

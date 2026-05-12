@@ -108,12 +108,21 @@ HDR_SIZE = struct.calcsize(HDR_FMT)
 # evt_running payload after header (64 bytes):
 #   runq_wait_ns(u64) waker_pid(u32) waker_tgid(u32) waker_flags(u16) cpu_perf(u16)
 #   prev_cpu(i32) wake_flags(u64) pmc_inst(u64) pmc_cyc(u64) pmc_l2(u64) pmc_stall(u64)
+#
+# `cpu_perf` and `pmc_*` are RESERVED-ZERO in the current producer
+# (see src/bpf/intf.h). The format string and size are frozen for v2
+# ABI stability so older v2 traces and the parser stay aligned;
+# `parse_event()` still decodes them so consumers can introspect the
+# field layout if they want, but normal summaries should ignore them.
 RUNNING_FMT = "<QIIHHiQQQQQ"
 RUNNING_SIZE = struct.calcsize(RUNNING_FMT)
 
 # evt_stopping payload after header (64 bytes):
 #   runtime_ns(u64) pmc_inst(u64) pmc_cyc(u64) pmc_l2(u64) pmc_stall(u64)
 #   slice_consumed(u64) slice_allocated(u64) voluntary(u8) pad(7 bytes)
+#
+# `pmc_*` are RESERVED-ZERO in the current producer (see
+# src/bpf/intf.h). Same v2 stability rationale as RUNNING_FMT.
 STOPPING_FMT = "<QQQQQQQB7x"
 STOPPING_SIZE = struct.calcsize(STOPPING_FMT)
 

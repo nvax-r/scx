@@ -3816,7 +3816,6 @@ dependencies = [
  "libc",
  "log",
  "nix 0.29.0",
- "perf-event-open-sys",
  "scx_cargo",
  "scx_utils",
  "simplelog",
